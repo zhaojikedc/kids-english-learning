@@ -1,0 +1,6 @@
+# 复制成 .dev.vars 后再填写。这个例子没有密钥，.dev.vars 不要提交。
+# 本地 `node server.js` 读环境变量 DEEPSEEK_API_KEY，不读这个文件。
+# `npx wrangler dev` / `npx wrangler deploy --secrets-file .dev.vars` 会读它。
+
+DEEPSEEK_API_KEY=
+ACCESS_CODE=

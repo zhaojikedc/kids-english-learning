@@ -1,0 +1,16 @@
+{
+  "name": "kids-english-learning",
+  "version": "1.0.0",
+  "private": true,
+  "description": "小树英语 · 复习本。本地 node server.js，线上 Cloudflare Workers 静态资源 + D1 + R2。",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_logic.js && node test_api.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "wrangler": "^4.168.0"
+  }
+}

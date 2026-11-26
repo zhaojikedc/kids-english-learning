@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="小树英语">
+<meta name="theme-color" content="#ff9f1c">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<title>小树英语 · 复习本</title>
+<link rel="stylesheet" href="styles.css?v=58">
+</head>
+<body>
+<header>
+  <h1>小树英语 · 复习本</h1>
+  <div class="sub">剑桥二级 · 学过的知识，定期回来看看</div>
+  <div class="buddy">
+    <div class="avatar" id="buddy-avatar"><img src="avatar.svg" alt="小树"></div>
+    <div class="bubble" id="buddy-bubble">今天也来学一点点吧！</div>
+  </div>
+  <div class="stats">
+    <div class="stat"><span class="ico">🗂️</span><b id="stat-total">0</b>卡片</div>
+    <div class="stat"><span class="ico">⏰</span><b id="stat-due">0</b>待复习</div>
+    <div class="stat"><span class="ico">🌟</span><b id="stat-master">0</b>已掌握</div>
+  </div>
+</header>
+
+<main>
+  <!-- 复习 -->
+  <section id="tab-review" class="active">
+    <div class="panel" id="review-idle">
+      <div id="review-board"></div>
+    </div>
+
+    <div class="panel" id="review-active" style="display:none;">
+      <div class="review-top">
+        <button class="mini-btn" id="review-back">← 返回任务</button>
+        <span class="muted" id="review-pos"></span>
+      </div>
+      <div class="progress-track"><div id="review-progress2"></div></div>
+      <div class="review-face">
+        <div class="type" id="review-type"></div>
+        <div class="question" id="review-question"></div>
+        <div class="review-ask" id="review-ask"></div>
+      </div>
+      <div class="review-answer-box">
+        <textarea id="review-input" placeholder="写出你的答案"></textarea>
+        <button class="btn primary wide" id="review-submit">提交答案</button>
+      </div>
+      <div class="review-feedback" id="review-feedback"></div>
+    </div>
+  </section>
+
+  <!-- 知识库 -->
+  <section id="tab-cards">
+    <div class="filter-row" id="filter-row">
+      <button data-filter="all" class="active">全部</button>
+      <button data-filter="单词">单词</button>
+      <button data-filter="语法">语法</button>
+      <button data-filter="例句">例句</button>
+      <button data-filter="其他">其他</button>
+    </div>
+    <div id="cards-list"></div>
+    <div style="margin-top:16px; display:flex; gap:10px;">
+      <button class="btn small" id="export-btn">导出备份</button>
+      <button class="btn small" id="import-btn">导入备份</button>
+      <input type="file" id="import-file" accept="application/json" style="display:none;">
+    </div>
+  </section>
+
+  <!-- 录入 -->
+  <section id="tab-add">
+    <div class="panel">
+      <div class="photo-box">
+        <span class="big">📷</span>
+        拍课本，AI 自动拆成卡片
+        <div class="muted" style="margin-top:4px;">可以一次选多张，拍清楚的英文页就行。</div>
+        <div class="photo-grid" id="photo-grid"></div>
+        <div class="row" style="margin-top:12px;">
+          <button class="btn blue small" id="pick-photo">拍照 / 选图</button>
+          <button class="btn small" id="pick-pdf">上传 PDF</button>
+        </div>
+        <div class="row" style="margin-top:8px;">
+          <button class="btn primary small" id="ai-gen" style="display:none; flex:1;">AI 生成卡片 ✨</button>
+        </div>
+        <input type="file" id="photo-input" accept="image/*" multiple style="display:none;">
+        <input type="file" id="pdf-input" accept="application/pdf" style="display:none;">
+        <div class="hint" id="ocr-status"></div>
+        <div class="preview-box" id="preview-box"></div>
+      </div>
+
+      <details class="manual">
+        <summary>手动加一张</summary>
+        <label>类型</label>
+        <select id="f-type">
+          <option>单词</option>
+          <option>语法</option>
+          <option>例句</option>
+          <option>其他</option>
+        </select>
+
+        <label>单元 / 出处（可不填）</label>
+        <input id="f-unit" placeholder="比如 Unit 3，或 课本第 12 页">
+
+        <label>问题（正面）</label>
+        <textarea id="f-question" placeholder="比如：过去式的否定句怎么变？"></textarea>
+
+        <label>答案（背面）</label>
+        <textarea id="f-answer" placeholder="比如：主语 + didn't + 动词原形。"></textarea>
+
+        <label>备注（可不填）</label>
+        <input id="f-note" placeholder="自己的小提示">
+
+        <div style="margin-top:18px; display:flex; gap:10px;">
+          <button class="btn primary" id="save-card" style="flex:1;">保存卡片 ✅</button>
+          <button class="btn" id="clear-form">清空</button>
+        </div>
+      </details>
+      <div class="hint">拍照后由 DeepSeek 看图拆卡片，聊天也用你账号里的模型。</div>
+    </div>
+  </section>
+
+  <!-- 聊天 -->
+  <section id="tab-chat">
+    <div class="panel">
+      <div class="profile-bar">
+        <button class="mini-btn" id="profile-btn">📋 学习档案</button>
+        <span class="profile-summary" id="profile-summary">还没有档案，多聊几次会自动生成</span>
+      </div>
+      <div class="chat-hints" id="chat-hints">
+        <button data-q="我之前学过哪些时态？">学过哪些时态</button>
+        <button data-q="过去式怎么用？">过去式怎么用</button>
+        <button data-q="帮我出三道练习题">出练习题</button>
+        <button data-q="我说错了你帮我改">帮我改句子</button>
+        <button id="shadow-btn" class="shadow">🎯 跟读练发音</button>
+      </div>
+      <div class="chat-wrap" id="chat-messages">
+        <div class="msg bot">
+          <div class="who">🦉 小树英语</div>
+          我是你的英语小老师。可以问我：学过的时态有哪些、这个词怎么用、帮我造个句子。
+        </div>
+      </div>
+      <div class="chat-inputbar">
+        <button class="icon-btn" id="tts-toggle" title="朗读回答">🔊</button>
+        <button class="icon-btn" id="mic-btn" title="点一下开始说话">🎤</button>
+        <input id="chat-input" placeholder="打字，或点麦克风说…" autocomplete="off">
+        <button class="btn primary small" id="chat-send">发送</button>
+      </div>
+      <div class="hint" id="speech-hint"><span id="speech-hint-text">点 🎤 说话 · 识别语言：</span><button id="lang-toggle">English</button></div>
+    </div>
+  </section>
+
+  <!-- 看板 -->
+  <section id="tab-board">
+    <div class="panel">
+      <div class="board-head">
+        <h2>学习看板</h2>
+        <span class="muted" id="board-range"></span>
+      </div>
+      <div class="week-nav">
+        <button class="mini-btn" id="week-prev">‹ 上一周</button>
+        <span class="week-label" id="week-label"></span>
+        <button class="mini-btn" id="week-next">下一周 ›</button>
+      </div>
+      <div class="board-stats" id="board-stats"></div>
+      <div class="hint" id="points-hint"></div>
+
+      <h4 class="board-title">📉 薄弱知识点</h4>
+      <div id="board-weak"></div>
+
+      <h4 class="board-title">🗣 发音记录</h4>
+      <div id="board-pronounce"></div>
+
+      <h4 class="board-title">❓ 常问的问题</h4>
+      <div id="board-questions"></div>
+
+      <h4 class="board-title">🌐 外网访问</h4>
+      <div class="board-item" id="tunnel-box">正在获取公网地址…</div>
+
+      <h4 class="board-title">📝 本周总结</h4>
+      <div class="board-report" id="board-report">还没生成，点下面按钮。</div>
+      <div id="board-tasks" style="margin-top:10px;"></div>
+      <button class="btn primary wide" id="board-gen" style="margin-top:10px;">生成本周总结</button>
+      <div class="hint" id="board-gen-hint"></div>
+    </div>
+  </section>
+</main>
+
+<nav>
+  <button data-tab="review" class="active"><span class="ico">📖</span>复习</button>
+  <button data-tab="cards"><span class="ico">🗂️</span>知识库</button>
+  <button data-tab="add"><span class="ico">✏️</span>录入</button>
+  <button data-tab="chat"><span class="ico">💬</span>聊天</button>
+  <button data-tab="board"><span class="ico">📊</span>看板</button>
+</nav>
+
+<div class="modal" id="profile-modal">
+  <div class="modal-box">
+    <h3>📋 小树的学习档案</h3>
+    <div class="modal-text" id="profile-text">还没有档案。</div>
+    <div class="muted" id="profile-updated"></div>
+    <div class="row" style="margin-top:14px;">
+      <button class="btn primary small" id="profile-refresh">根据聊天更新</button>
+      <button class="btn small" id="profile-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="goal-modal">
+  <div class="modal-box">
+    <h3>⚙️ 每日目标</h3>
+    <div class="muted" style="margin-bottom:8px;">按小树的适应情况调整每天复习多少张。</div>
+    <label>每天总目标（张）</label>
+    <input type="number" id="goal-total" min="1" max="100">
+    <div class="row">
+      <div><label>单词</label><input type="number" id="goal-单词" min="0" max="50"></div>
+      <div><label>语法</label><input type="number" id="goal-语法" min="0" max="50"></div>
+    </div>
+    <div class="row">
+      <div><label>例句</label><input type="number" id="goal-例句" min="0" max="50"></div>
+      <div><label>其他</label><input type="number" id="goal-其他" min="0" max="50"></div>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <button class="btn primary small" id="goal-save">保存</button>
+      <button class="btn small" id="goal-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="edit-modal">
+  <div class="modal-box">
+    <h3>编辑卡片</h3>
+    <label>类型</label>
+    <select id="edit-type">
+      <option>单词</option><option>语法</option><option>例句</option><option>其他</option>
+    </select>
+    <label>单元 / 出处</label>
+    <input id="edit-unit">
+    <label>问题</label>
+    <textarea id="edit-question"></textarea>
+    <label>答案</label>
+    <textarea id="edit-answer"></textarea>
+    <div class="row" style="margin-top:14px;">
+      <button class="btn primary small" id="edit-save">保存</button>
+      <button class="btn small" id="edit-close">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="access-modal">
+  <div class="modal-box">
+    <h3>🔒 需要访问码</h3>
+    <div class="muted" style="margin-bottom:10px;">本机看板的「外网访问」能看到访问码。用 Cloudflare 打开时，填写家里设定的访问码。</div>
+    <input id="access-input" placeholder="输入 6 位访问码" autocomplete="off">
+    <div class="row" style="margin-top:14px;">
+      <button class="btn primary small" id="access-save">确定</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://fastly.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="logic.js?v=58"></script>
+<script src="app.js?v=58"></script>
+<script>
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("/sw.js").catch(function () {});
+    });
+  }
+</script>
+</body>
+</html>
