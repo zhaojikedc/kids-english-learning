@@ -1,0 +1,9 @@
+# 页面和 Service Worker 不要被长期缓存，改完能马上看到。
+/
+  Cache-Control: no-cache
+
+/index.html
+  Cache-Control: no-cache
+
+/sw.js
+  Cache-Control: no-cache

@@ -1,0 +1,47 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "kids-english-learning",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-26",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  // 已有的 Pages 项目 kids-english-learning 是 Direct Upload，不能改成 Git 集成。
+  // 这里是另一个产品：带静态资源的 Worker，不会改那个 Pages 项目。
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/images/*"]
+  },
+  "vars": {
+    "MODEL": "deepseek-flash",
+    "OCR_MODEL": "deepseek-chat"
+  },
+  // Workers Free 的 CPU 上限是 10ms。拍照识别要解析图片，建议用 Workers Paid。
+  // 付费计划可以取消下面的注释，把 CPU 时间放到 30 秒：
+  // "limits": { "cpu_ms": 30000 },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kids-english-learning",
+      // database_id 先不写。运行 `npx wrangler d1 create kids-english-learning --update-config` 后会填上真实 id。
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "kids-english-learning"
+    }
+  ]
+}

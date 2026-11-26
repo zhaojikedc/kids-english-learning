@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.xiaoyang.cloudflared</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/zhaojk/.dsh/bot/workspace/english-app/bin/cloudflared</string>
+    <string>tunnel</string>
+    <string>--url</string>
+    <string>http://127.0.0.1:8787</string>
+    <string>--no-autoupdate</string>
+    <string>--protocol</string>
+    <string>http2</string>
+    <string>--edge-ip-version</string>
+    <string>4</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/xy_cf.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/xy_cf.err.log</string>
+</dict>
+</plist>

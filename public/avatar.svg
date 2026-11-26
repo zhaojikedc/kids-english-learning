@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="小树">
+  <circle cx="64" cy="64" r="64" fill="#8fd18a"/>
+  <circle cx="64" cy="54" r="36" fill="#3f9d55"/>
+  <circle cx="46" cy="62" r="18" fill="#67c56f"/>
+  <circle cx="82" cy="60" r="16" fill="#67c56f"/>
+  <rect x="58" y="78" width="12" height="30" rx="6" fill="#c9864a"/>
+  <circle cx="54" cy="52" r="3.2" fill="#1f3a24"/>
+  <circle cx="74" cy="52" r="3.2" fill="#1f3a24"/>
+  <path d="M56 62c3 5 13 5 16 0" fill="none" stroke="#1f3a24" stroke-width="3" stroke-linecap="round"/>
+</svg>
