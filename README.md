@@ -41,8 +41,10 @@ npm test
 | `BUCKET` | R2 | `kids-english-learning` | 课本页图片 `images/`，周总结 `knowledge-base/weekly/`，以后的知识库文档放 `knowledge-base/docs/` |
 | `ASSETS` | Workers 静态资源 | `public/` | 页面、脚本、样式、图标 |
 | `MODEL` | 变量 | `deepseek-flash` | 聊天模型，不是密钥 |
-| `OCR_MODEL` | 变量 | `deepseek-chat` | 识图模型，不是密钥 |
+| `OCR_MODEL` | 变量 | `deepseek-flash` | 识图模型，不是密钥。官方当前带视觉的模型是 `deepseek-flash`；`deepseek-chat` 已不在模型列表里 |
 | `DEEPSEEK_API_KEY` | Secret | | DeepSeek 密钥。用 `wrangler secret put` 或 `--secrets-file` 设置 |
+
+聊天和识图都走官方 `https://api.deepseek.com/chat/completions`，并带上 `thinking: { type: "disabled" }`。不传这个字段时，官方接口默认先思考再回答；非流式要等思考结束，页面会在答案出来前显示超时。日常复习不需要思考模式。页面等聊天的时间略长于服务端的 240 秒，这样服务端自己的超时能回到页面上，而不是页面先掐断。
 | `ACCESS_CODE` | Secret，可选 | | 公网访问码。不设置时，第一次需要校验的请求会在 D1 里生成一个 6 位数 |
 
 Workers 有日志和 trace（`observability` 已打开）。

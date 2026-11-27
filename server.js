@@ -22,7 +22,7 @@ const PUBLIC_DIR = path.join(ROOT, "public");
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "::";
 const MODEL = process.env.MODEL || "deepseek-flash";
-const OCR_MODEL = process.env.OCR_MODEL || "deepseek-chat";
+const OCR_MODEL = process.env.OCR_MODEL || "deepseek-flash";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",

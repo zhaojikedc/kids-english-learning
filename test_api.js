@@ -5,12 +5,14 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const vm = require("vm");
 const { DatabaseSync } = require("node:sqlite");
 const { parseCards } = require("./lib/core");
 const { handleApi } = require("./lib/route");
 const { createFsStore } = require("./lib/store-fs");
 const { createD1Store } = require("./lib/store-d1");
 const { createLocalServer } = require("./server");
+const { complete } = require("./lib/deepseek");
 
 let pass = 0;
 function ok(name, fn) {
@@ -103,7 +105,7 @@ function ctxFor(store, extra) {
     accessCode: options.accessCode || "",
     apiKey: options.apiKey || "",
     model: "deepseek-flash",
-    ocrModel: "deepseek-chat",
+    ocrModel: options.ocrModel || "deepseek-flash",
     ocrInline: options.ocrInline !== false,
     header: (name) => (options.headers && options.headers[String(name).toLowerCase()]) || "",
     readJson: async () => ({ ok: true, value: options.body || {} }),
@@ -246,6 +248,104 @@ async function main() {
     assert.match(chat.json.error, /DEEPSEEK_API_KEY/);
     const ocr = await handleApi(ctxFor(store, { method: "POST", pathname: "/api/ocr-cards", apiKey: "", body: { images: [PNG] } }));
     assert.strictEqual(ocr.status, 500);
+  });
+
+  await ok("聊天和识图请求关掉思考模式，并使用当前官方模型", async () => {
+    let chatPayload = null;
+    const chat = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/chat",
+      apiKey: "test-key",
+      body: {
+        messages: [{ role: "user", content: "hi" }],
+        thinking: { type: "enabled" }
+      },
+      complete: async (payload, timeoutMs) => {
+        chatPayload = { payload: payload, timeoutMs: timeoutMs };
+        return { ok: true, status: 200, content: "hello", reasoning: "", usage: null, error: "" };
+      }
+    }));
+    assert.strictEqual(chat.status, 200);
+    assert.strictEqual(chat.json.content, "hello");
+    assert.strictEqual(chatPayload.timeoutMs, 240000);
+    assert.strictEqual(chatPayload.payload.model, "deepseek-flash");
+    assert.deepStrictEqual(chatPayload.payload.thinking, { type: "disabled" });
+
+    let ocrPayload = null;
+    const ocr = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/ocr-cards",
+      apiKey: "test-key",
+      ocrInline: true,
+      body: { images: [PNG] },
+      complete: async (payload, timeoutMs) => {
+        ocrPayload = { payload: payload, timeoutMs: timeoutMs };
+        return { ok: true, status: 200, content: "[]", reasoning: "", usage: null, error: "" };
+      }
+    }));
+    assert.strictEqual(ocr.status, 200);
+    assert.strictEqual(ocrPayload.timeoutMs, 600000);
+    assert.strictEqual(ocrPayload.payload.model, "deepseek-flash");
+    assert.deepStrictEqual(ocrPayload.payload.thinking, { type: "disabled" });
+  });
+
+  await ok("发给官方接口的请求也会强制关掉思考模式", async () => {
+    const original = global.fetch;
+    let sent = null;
+    global.fetch = async (url, opts) => {
+      sent = { url: url, body: JSON.parse(opts.body), auth: opts.headers.Authorization };
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: "ok", reasoning_content: "hidden" } }],
+        usage: { total_tokens: 3 }
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    try {
+      const result = await complete("test-key", {
+        model: "deepseek-flash",
+        messages: [{ role: "user", content: "hi" }],
+        thinking: { type: "enabled" }
+      }, 1000);
+      assert.strictEqual(result.ok, true);
+      assert.strictEqual(result.content, "ok");
+      assert.strictEqual(sent.url, "https://api.deepseek.com/chat/completions");
+      assert.strictEqual(sent.auth, "Bearer test-key");
+      assert.strictEqual(sent.body.model, "deepseek-flash");
+      assert.deepStrictEqual(sent.body.thinking, { type: "disabled" });
+    } finally {
+      global.fetch = original;
+    }
+  });
+
+  await ok("页面聊天等待长于服务端，服务端错误不再说成本机没启动", () => {
+    const app = fs.readFileSync(path.join(__dirname, "public", "app.js"), "utf8");
+    assert.match(app, /var CHAT_WAIT_MS = 250000;/);
+    assert.ok(!app.includes("70000"));
+    const start = app.indexOf("function isLocalPage()");
+    const end = app.indexOf("function cardDigest()");
+    assert.ok(start > 0 && end > start);
+    function messagesFor(hostname) {
+      const sandbox = { location: { hostname: hostname } };
+      vm.createContext(sandbox);
+      vm.runInContext(app.slice(start, end) + [
+        "this.out = {",
+        "  abort: chatFailText({ name: 'AbortError' }),",
+        "  server: chatFailText({ reachedServer: true, message: '请求超时' }),",
+        "  down: chatFailText(new TypeError('Failed to fetch'))",
+        "};"
+      ].join("\n"), sandbox);
+      return sandbox.out;
+    }
+    const local = messagesFor("127.0.0.1");
+    const cloud = messagesFor("kids-english-learning.example.workers.dev");
+    const timeoutCopy = "等太久了，可能网络卡了，再试一次。";
+    const localCopy = "连不上小老师服务。是不是服务没启动？看看有没有打开「启动小树英语.command」。";
+    assert.strictEqual(local.abort, timeoutCopy);
+    assert.strictEqual(cloud.abort, timeoutCopy);
+    assert.strictEqual(local.server, "请求超时");
+    assert.strictEqual(cloud.server, "请求超时");
+    assert.strictEqual(local.down, localCopy);
+    assert.ok(!cloud.down.includes("启动小树英语.command"));
+    assert.match(cloud.down, /检查网络后再试一次/);
   });
 
   await ok("识图走完会把图片放进 R2，卡片带上图片路径", async () => {

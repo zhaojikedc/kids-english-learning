@@ -25,7 +25,7 @@
   },
   "vars": {
     "MODEL": "deepseek-flash",
-    "OCR_MODEL": "deepseek-chat"
+    "OCR_MODEL": "deepseek-flash"
   },
   // Workers Free 的 CPU 上限是 10ms。拍照识别要解析图片，建议用 Workers Paid。
   // 付费计划可以取消下面的注释，把 CPU 时间放到 30 秒：

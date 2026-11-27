@@ -1137,6 +1137,28 @@
   }
 
   /* ---------- 聊天 ---------- */
+  // 服务端聊天最多等 240 秒。页面再多留 10 秒，好接住服务端的超时，而不是自己先掐断。
+  var CHAT_WAIT_MS = 250000;
+
+  function isLocalPage() {
+    var host = "";
+    try { host = String(location.hostname || "").toLowerCase(); } catch (e) { host = ""; }
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  }
+
+  function chatFailText(err) {
+    if (err && err.name === "AbortError") {
+      return "等太久了，可能网络卡了，再试一次。";
+    }
+    if (err && err.reachedServer) {
+      return (err.message && String(err.message).trim()) || "小老师这次没答上来，再试一次。";
+    }
+    if (isLocalPage()) {
+      return "连不上小老师服务。是不是服务没启动？看看有没有打开「启动小树英语.command」。";
+    }
+    return "连不上小老师服务，检查网络后再试一次。";
+  }
+
   function cardDigest() {
     var list = cards.slice(-200);
     if (!list.length) return "（他还没录入任何卡片）";
@@ -1216,7 +1238,7 @@
       .concat(chatHistory.slice(-12).map(function (m) { return { role: m.role, content: m.content }; }));
 
     var ctrl = new AbortController();
-    var timer = setTimeout(function () { ctrl.abort(); }, 70000);
+    var timer = setTimeout(function () { ctrl.abort(); }, CHAT_WAIT_MS);
 
     fetch("/api/chat", {
       method: "POST",
@@ -1225,13 +1247,21 @@
       signal: ctrl.signal
     })
       .then(function (r) {
-        return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+        return r.json().then(function (d) {
+          return { ok: r.ok, d: d };
+        }, function () {
+          var bad = new Error(r.ok ? "返回内容读不懂" : ("服务返回错误（" + r.status + "）"));
+          bad.reachedServer = true;
+          throw bad;
+        });
       })
       .then(function (res) {
         clearTimeout(timer);
         typing.remove();
         if (!res.ok) {
-          throw new Error((res.d && res.d.error) || "服务返回错误");
+          var failed = new Error((res.d && res.d.error) || "服务返回错误");
+          failed.reachedServer = true;
+          throw failed;
         }
         var answer = (res.d.content || "").trim();
         if (!answer) answer = "我这边没组织好答案，你再问一次？";
@@ -1244,10 +1274,7 @@
       .catch(function (err) {
         clearTimeout(timer);
         typing.remove();
-        var msg = err && err.name === "AbortError"
-          ? "等太久了，可能网络卡了，再试一次。"
-          : "连不上小老师服务。是不是服务没启动？看看有没有打开「启动小树英语.command」。";
-        addMsg("bot", msg);
+        addMsg("bot", chatFailText(err));
       })
       .then(function () {
         chatBusy = false;
@@ -1508,7 +1535,7 @@
       { role: "user", content: "目标句：" + target + "\n他读出来被识别成：" + said + "\n没对上的词：" + (r.missing.join(" ") || "无") }
     ];
     var ctrl = new AbortController();
-    var timer = setTimeout(function () { ctrl.abort(); }, 70000);
+    var timer = setTimeout(function () { ctrl.abort(); }, CHAT_WAIT_MS);
     fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
