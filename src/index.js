@@ -92,7 +92,7 @@ async function handle(request, env) {
     accessCode: accessCode,
     apiKey: apiKey,
     model: env.MODEL || "deepseek-flash",
-    ocrModel: env.OCR_MODEL || "deepseek-chat",
+    ocrModel: env.OCR_MODEL || "deepseek-flash",
     ocrInline: true,
     header: (name) => request.headers.get(name) || "",
     readJson: () => readJson(request),

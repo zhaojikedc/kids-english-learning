@@ -6,7 +6,7 @@ interface __BaseEnv_Env {
 	DB: D1Database;
 	ASSETS: Fetcher;
 	MODEL: "deepseek-flash";
-	OCR_MODEL: "deepseek-chat";
+	OCR_MODEL: "deepseek-flash";
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
