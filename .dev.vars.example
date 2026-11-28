@@ -4,3 +4,6 @@
 
 DEEPSEEK_API_KEY=
 ACCESS_CODE=
+# 语音服务。`npx wrangler dev` 会读这里。本机 python3 asr/server.py 默认就是这个地址。
+# WHISPER_URL=http://127.0.0.1:8788
+# WHISPER_TOKEN=

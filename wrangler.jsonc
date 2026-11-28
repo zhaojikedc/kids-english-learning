@@ -27,6 +27,8 @@
     "MODEL": "deepseek-flash",
     "OCR_MODEL": "deepseek-flash"
   },
+  // 语音模型不在 Worker 里跑。WHISPER_URL 指向自建的 faster-whisper（asr/server.py）。
+  // 用 `wrangler secret put WHISPER_URL` 设置，可选 `WHISPER_TOKEN`。不要把地址或口令写进这个文件。
   // Workers Free 的 CPU 上限是 10ms。拍照识别要解析图片，建议用 Workers Paid。
   // 付费计划可以取消下面的注释，把 CPU 时间放到 30 秒：
   // "limits": { "cpu_ms": 30000 },

@@ -13,7 +13,7 @@ const { createFsStore } = require("./lib/store-fs");
 const { createD1Store } = require("./lib/store-d1");
 const { createLocalServer } = require("./server");
 const { complete } = require("./lib/deepseek");
-const { validateWav, transcribe, ASR_URL, ASR_TIMEOUT_MS, WAV_MAX_BYTES } = require("./lib/asr");
+const { validateWav, transcribe, WHISPER_PATH, ASR_TIMEOUT_MS, WAV_MAX_BYTES } = require("./lib/asr");
 
 let pass = 0;
 function ok(name, fn) {
@@ -293,10 +293,21 @@ async function main() {
       method: "POST",
       pathname: "/api/transcribe",
       apiKey: "",
+      headers: { "x-speech-lang": "en" },
       readBytes: async () => ({ ok: true, value: makeWav() })
     }));
     assert.strictEqual(speech.status, 500);
-    assert.match(speech.json.error, /DEEPSEEK_API_KEY/);
+    assert.match(speech.json.error, /语音识别服务/);
+    const stillWorks = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "",
+      headers: { "x-speech-lang": "en" },
+      readBytes: async () => ({ ok: true, value: makeWav() }),
+      transcribe: async () => ({ ok: true, status: 200, text: "I like apples", error: "" })
+    }));
+    assert.strictEqual(stillWorks.status, 200);
+    assert.strictEqual(stillWorks.json.text, "I like apples");
   });
 
   await ok("语音转写成功时只返回文本，并原样把 WAV 交给识别", async () => {
@@ -309,10 +320,11 @@ async function main() {
     const result = await handleApi(ctxFor(store, {
       method: "POST",
       pathname: "/api/transcribe",
-      apiKey: "test-key",
+      apiKey: "",
+      headers: { "x-speech-lang": "en", "x-speech-final": "0" },
       readBytes: async () => ({ ok: true, value: wav }),
-      transcribe: async (bytes, timeoutMs) => {
-        seen = { bytes: Buffer.from(bytes), timeoutMs: timeoutMs };
+      transcribe: async (bytes, options) => {
+        seen = { bytes: Buffer.from(bytes), timeoutMs: options.timeoutMs, language: options.language, final: options.final };
         return { ok: true, status: 200, text: "  What is the weather like in Shanghai today?  ", error: "" };
       }
     }));
@@ -320,7 +332,43 @@ async function main() {
     assert.deepStrictEqual(Object.keys(result.json), ["text"]);
     assert.strictEqual(result.json.text, "What is the weather like in Shanghai today?");
     assert.strictEqual(seen.timeoutMs, ASR_TIMEOUT_MS);
+    assert.strictEqual(seen.language, "en");
+    assert.strictEqual(seen.final, false);
     assert.ok(seen.bytes.equals(wav));
+
+    const chinese = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      headers: { "x-speech-lang": "zh", "x-speech-final": "1" },
+      readBytes: async () => ({ ok: true, value: wav }),
+      transcribe: async (bytes, options) => {
+        seen = options;
+        return { ok: true, status: 200, text: "  我喜欢苹果  ", error: "" };
+      }
+    }));
+    assert.strictEqual(chinese.status, 200);
+    assert.strictEqual(chinese.json.text, "我喜欢苹果");
+    assert.strictEqual(seen.language, "zh");
+    assert.strictEqual(seen.final, true);
+
+    let calls = 0;
+    const missingLang = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      readBytes: async () => ({ ok: true, value: wav }),
+      transcribe: async () => { calls += 1; return { ok: true, status: 200, text: "nope", error: "" }; }
+    }));
+    assert.strictEqual(missingLang.status, 400);
+    assert.strictEqual(missingLang.json.error, "请先选择中文或英文");
+    const autoLang = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      headers: { "x-speech-lang": "auto" },
+      readBytes: async () => ({ ok: true, value: wav }),
+      transcribe: async () => { calls += 1; return { ok: true, status: 200, text: "nope", error: "" }; }
+    }));
+    assert.strictEqual(autoLang.status, 400);
+    assert.strictEqual(calls, 0);
   });
 
   await ok("语音转写拒绝空音频、非 WAV 和超限音频，且不会请求上游", async () => {
@@ -329,10 +377,12 @@ async function main() {
       calls += 1;
       return { ok: true, status: 200, text: "nope", error: "" };
     };
+    const lang = { "x-speech-lang": "en" };
     const missing = await handleApi(ctxFor(store, {
       method: "POST",
       pathname: "/api/transcribe",
       apiKey: "test-key",
+      headers: lang,
       readBytes: async () => ({ ok: false, status: 400, error: "没有收到音频" }),
       transcribe: transcribe
     }));
@@ -343,6 +393,7 @@ async function main() {
       method: "POST",
       pathname: "/api/transcribe",
       apiKey: "test-key",
+      headers: lang,
       readBytes: async () => ({ ok: true, value: Buffer.alloc(0) }),
       transcribe: transcribe
     }));
@@ -353,6 +404,7 @@ async function main() {
       method: "POST",
       pathname: "/api/transcribe",
       apiKey: "test-key",
+      headers: lang,
       readBytes: async () => ({ ok: true, value: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x00]) }),
       transcribe: transcribe
     }));
@@ -363,6 +415,7 @@ async function main() {
       method: "POST",
       pathname: "/api/transcribe",
       apiKey: "test-key",
+      headers: lang,
       readBytes: async () => ({ ok: true, value: makeWav({ format: 3, bits: 32 }) }),
       transcribe: transcribe
     }));
@@ -385,6 +438,7 @@ async function main() {
       method: "POST",
       pathname: "/api/transcribe",
       apiKey: "test-key",
+      headers: { "x-speech-lang": "zh" },
       readBytes: async () => ({ ok: true, value: makeWav() }),
       transcribe: async () => ({ ok: false, status: 503, text: "", error: "识别服务忙，稍后再试" })
     }));
@@ -395,6 +449,7 @@ async function main() {
       method: "POST",
       pathname: "/api/transcribe",
       apiKey: "test-key",
+      headers: { "x-speech-lang": "en" },
       readBytes: async () => ({ ok: true, value: makeWav() }),
       transcribe: async () => { throw new Error("socket hang up"); }
     }));
@@ -407,7 +462,7 @@ async function main() {
       pathname: "/api/transcribe",
       isPublic: true,
       apiKey: "test-key",
-      headers: { "x-access-code": "000000" },
+      headers: { "x-access-code": "000000", "x-speech-lang": "en" },
       readBytes: async () => ({ ok: true, value: makeWav() }),
       transcribe: async () => ({ ok: true, status: 200, text: "secret", error: "" })
     }));
@@ -417,7 +472,7 @@ async function main() {
       pathname: "/api/transcribe",
       isPublic: true,
       apiKey: "test-key",
-      headers: { "x-access-code": hidden.json.code },
+      headers: { "x-access-code": hidden.json.code, "x-speech-lang": "en" },
       readBytes: async () => ({ ok: true, value: makeWav() }),
       transcribe: async () => ({ ok: true, status: 200, text: "a cat", error: "" })
     }));
@@ -425,47 +480,77 @@ async function main() {
     assert.strictEqual(allowed.json.text, "a cat");
   });
 
-  await ok("官方语音接口收到 multipart 文件，并翻译上游错误", async () => {
+  await ok("语音请求转到 faster-whisper，英文和中文都原样返回，不翻译", async () => {
     const original = global.fetch;
     const wav = makeWav({ seconds: 0.25 });
+    const asrSrc = fs.readFileSync(path.join(__dirname, "lib", "asr.js"), "utf8");
+    const py = fs.readFileSync(path.join(__dirname, "asr", "server.py"), "utf8");
+    assert.ok(!asrSrc.includes("api.deepseek.com"));
+    assert.ok(asrSrc.includes(WHISPER_PATH));
+    assert.ok(py.includes("mobiuslabsgmbh/faster-whisper-large-v3-turbo"));
+    assert.ok(py.includes('task="transcribe"'));
+    assert.ok(!py.includes('task="translate"'));
+    assert.ok(!py.includes("api.deepseek.com"));
     try {
       let sent = null;
       global.fetch = async (url, opts) => {
-        const file = opts.body.get("file");
         sent = {
           url: url,
           method: opts.method,
           auth: opts.headers.Authorization,
-          contentType: opts.headers["Content-Type"] || opts.headers["content-type"] || "",
-          language: opts.body.get("language"),
-          name: file && file.name,
-          bytes: Buffer.from(await file.arrayBuffer())
+          contentType: opts.headers["Content-Type"],
+          language: opts.headers["X-Speech-Lang"],
+          final: opts.headers["X-Speech-Final"],
+          bytes: Buffer.from(opts.body)
         };
-        return new Response(JSON.stringify({
-          request_id: "req_test",
-          text: "a cat",
-          duration_ms: 250
-        }), { status: 200, headers: { "Content-Type": "application/json" } });
+        const text = opts.headers["X-Speech-Lang"] === "zh" ? "我喜欢苹果" : "I like apples";
+        return new Response(JSON.stringify({ text: text }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
       };
-      const okResult = await transcribe("test-key", wav, 1000);
-      assert.strictEqual(okResult.ok, true);
-      assert.strictEqual(okResult.text, "a cat");
-      assert.strictEqual(sent.url, ASR_URL);
+      const english = await transcribe("http://127.0.0.1:8788/", wav, {
+        language: "en",
+        final: false,
+        timeoutMs: 1000,
+        token: "family-token"
+      });
+      assert.strictEqual(english.ok, true);
+      assert.strictEqual(english.text, "I like apples");
+      assert.strictEqual(sent.url, "http://127.0.0.1:8788" + WHISPER_PATH);
       assert.strictEqual(sent.method, "POST");
-      assert.strictEqual(sent.auth, "Bearer test-key");
-      assert.strictEqual(sent.contentType, "");
-      assert.strictEqual(sent.language, null);
-      assert.strictEqual(sent.name, "speech.wav");
+      assert.strictEqual(sent.auth, "Bearer family-token");
+      assert.strictEqual(sent.contentType, "audio/wav");
+      assert.strictEqual(sent.language, "en");
+      assert.strictEqual(sent.final, "0");
       assert.ok(sent.bytes.equals(wav));
 
-      global.fetch = async () => new Response(JSON.stringify({ error: { message: "busy" } }), { status: 503 });
-      const busy = await transcribe("test-key", wav, 1000);
+      const chinese = await transcribe("http://whisper.example", wav, {
+        language: "zh",
+        final: true,
+        timeoutMs: 1000
+      });
+      assert.strictEqual(chinese.ok, true);
+      assert.strictEqual(chinese.text, "我喜欢苹果");
+      assert.strictEqual(sent.language, "zh");
+      assert.strictEqual(sent.final, "1");
+      assert.strictEqual(sent.auth, undefined);
+
+      const unlocked = await transcribe("http://127.0.0.1:8788", wav, { timeoutMs: 1000 });
+      assert.strictEqual(unlocked.ok, false);
+      assert.strictEqual(unlocked.status, 400);
+      const missing = await transcribe("", wav, { language: "en", timeoutMs: 1000 });
+      assert.strictEqual(missing.ok, false);
+      assert.strictEqual(missing.status, 500);
+
+      global.fetch = async () => new Response(JSON.stringify({ error: "识别服务忙，稍后再试" }), { status: 503 });
+      const busy = await transcribe("http://127.0.0.1:8788", wav, { language: "en", timeoutMs: 1000 });
       assert.strictEqual(busy.ok, false);
       assert.strictEqual(busy.status, 503);
       assert.strictEqual(busy.error, "识别服务忙，稍后再试");
 
       global.fetch = async () => new Response("not-json", { status: 200, headers: { "Content-Type": "text/plain" } });
-      const bad = await transcribe("test-key", wav, 1000);
+      const bad = await transcribe("http://127.0.0.1:8788", wav, { language: "zh", timeoutMs: 1000 });
       assert.strictEqual(bad.ok, false);
       assert.strictEqual(bad.status, 502);
 
@@ -474,7 +559,7 @@ async function main() {
         err.name = "TimeoutError";
         throw err;
       };
-      const timed = await transcribe("test-key", wav, 1000);
+      const timed = await transcribe("http://127.0.0.1:8788", wav, { language: "en", timeoutMs: 1000 });
       assert.strictEqual(timed.ok, false);
       assert.strictEqual(timed.status, 504);
       assert.strictEqual(timed.error, "识别超时");
@@ -497,11 +582,25 @@ async function main() {
     assert.ok(app.includes("没听到说话"));
     assert.ok(app.includes("识别超时"));
     assert.ok(app.includes("识别失败"));
-    assert.ok(html.includes("app.js?v=60"));
-    assert.ok(html.includes("中英文自动识别"));
-    assert.ok(!html.includes("lang-toggle"));
-    assert.ok(sw.includes("xiaoshu-english-v56"));
-    assert.ok(sw.includes("/app.js?v=60"));
+    assert.ok(app.includes("x-speech-lang"));
+    assert.ok(app.includes("L.speechStep"));
+    assert.ok(app.includes("pointerdown"));
+    assert.ok(app.includes("function completeTalk"));
+    const complete = app.slice(app.indexOf("function completeTalk"), app.indexOf("function pumpTalk"));
+    assert.ok(complete.includes("chat-input"));
+    assert.ok(!complete.includes("sendChat"));
+    assert.ok(!app.includes("再说一次结束"));
+    assert.ok(!app.includes("中英文自动识别"));
+    assert.ok(!app.includes("api.deepseek.com"));
+    assert.ok(html.includes("app.js?v=61"));
+    assert.ok(html.includes("logic.js?v=59"));
+    assert.ok(html.includes("lang-toggle"));
+    assert.ok(html.includes("English"));
+    assert.ok(!html.includes("中英文自动识别"));
+    assert.ok(!html.includes("再说一次结束"));
+    assert.ok(sw.includes("xiaoshu-english-v57"));
+    assert.ok(sw.includes("/app.js?v=61"));
+    assert.ok(sw.includes("/logic.js?v=59"));
   });
 
   await ok("聊天和识图请求关掉思考模式，并使用当前官方模型", async () => {
@@ -759,10 +858,15 @@ async function main() {
     imagesDir: path.join(speechTmp, "images"),
     knowledgeDir: path.join(speechTmp, "kb"),
     apiKey: "test-key",
-    transcribe: async (bytes, timeoutMs) => {
-      forwarded = { bytes: Buffer.from(bytes), timeoutMs: timeoutMs };
+    transcribe: async (bytes, options) => {
+      forwarded = {
+        bytes: Buffer.from(bytes),
+        timeoutMs: options.timeoutMs,
+        language: options.language,
+        final: options.final
+      };
       if (upstreamMode === "error") return { ok: false, status: 502, text: "", error: "识别失败" };
-      return { ok: true, status: 200, text: "I like apples", error: "" };
+      return { ok: true, status: 200, text: options.language === "zh" ? "我喜欢苹果" : "I like apples", error: "" };
     }
   });
   await new Promise((resolve) => speechServer.listen(0, "127.0.0.1", resolve));
@@ -772,7 +876,7 @@ async function main() {
       const wav = makeWav({ seconds: 0.3 });
       const okRes = await fetch(speechBase + "/api/transcribe", {
         method: "POST",
-        headers: { "Content-Type": "audio/wav" },
+        headers: { "Content-Type": "audio/wav", "x-speech-lang": "en", "x-speech-final": "0" },
         body: wav
       });
       const okJson = await okRes.json();
@@ -780,9 +884,35 @@ async function main() {
       assert.strictEqual(okJson.text, "I like apples");
       assert.ok(forwarded.bytes.equals(wav));
       assert.strictEqual(forwarded.timeoutMs, ASR_TIMEOUT_MS);
+      assert.strictEqual(forwarded.language, "en");
+      assert.strictEqual(forwarded.final, false);
+
+      const zhRes = await fetch(speechBase + "/api/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": "audio/wav", "x-speech-lang": "zh", "x-speech-final": "1" },
+        body: wav
+      });
+      const zhJson = await zhRes.json();
+      assert.strictEqual(zhRes.status, 200);
+      assert.strictEqual(zhJson.text, "我喜欢苹果");
+      assert.strictEqual(forwarded.language, "zh");
+      assert.strictEqual(forwarded.final, true);
 
       forwarded = null;
-      const missing = await fetch(speechBase + "/api/transcribe", { method: "POST" });
+      const noLang = await fetch(speechBase + "/api/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": "audio/wav" },
+        body: wav
+      });
+      const noLangJson = await noLang.json();
+      assert.strictEqual(noLang.status, 400);
+      assert.strictEqual(noLangJson.error, "请先选择中文或英文");
+      assert.strictEqual(forwarded, null);
+
+      const missing = await fetch(speechBase + "/api/transcribe", {
+        method: "POST",
+        headers: { "x-speech-lang": "en" }
+      });
       const missingJson = await missing.json();
       assert.strictEqual(missing.status, 400);
       assert.strictEqual(missingJson.error, "没有收到音频");
@@ -790,7 +920,7 @@ async function main() {
 
       const invalid = await fetch(speechBase + "/api/transcribe", {
         method: "POST",
-        headers: { "Content-Type": "audio/webm" },
+        headers: { "Content-Type": "audio/webm", "x-speech-lang": "en" },
         body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x01, 0x02, 0x03, 0x04])
       });
       const invalidJson = await invalid.json();
@@ -801,7 +931,7 @@ async function main() {
       upstreamMode = "error";
       const failed = await fetch(speechBase + "/api/transcribe", {
         method: "POST",
-        headers: { "Content-Type": "audio/wav" },
+        headers: { "Content-Type": "audio/wav", "x-speech-lang": "en" },
         body: wav
       });
       const failedJson = await failed.json();

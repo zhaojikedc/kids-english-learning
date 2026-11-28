@@ -48,7 +48,14 @@
   var recordSampleRate = 16000;
   var recordTimer = null;
   var shadowWaited = 0;
-  var IDLE_SPEECH_HINT = "点一下开始，再说一次结束。中英文自动识别。";
+  var SPEECH_LANG_KEY = "xy_speech_lang";
+  var speechLang = "en";
+  var talk = null;
+  var talkTick = null;
+  var pointerDown = false;
+  var pressAt = 0;
+  var pendingRelease = null;
+  var IDLE_SPEECH_HINT = "点一下或按住麦克风说话，停一下就结束。识别语言：";
   var PCM_WORKLET = [
     "class PcmCaptureProcessor extends AudioWorkletProcessor {",
     "  process(inputs) {",
@@ -1371,12 +1378,11 @@
   }
 
   /* ---------- 语音 ---------- */
-  // 浏览器自带的语音识别会把声音发到 Google，在中国大陆经常没有转写结果。
-  // 这里在手机上录 16-bit PCM WAV，再交给 /api/transcribe。不要上传 webm。
+  // 浏览器自带的语音识别会把声音发到 Google，在中国大陆经常没有字。
+  // 手机上录 16-bit PCM WAV。一边说，一边把这句话到目前为止的音频交给 /api/transcribe。
+  // 服务用 faster-whisper 按页面锁定的中文或英文转写，不翻译。字留在输入框里，不自动发送。
   var TARGET_RATE = 16000;
-  var MAX_RECORD_MS = 90000;
-  var MIN_RECORD_SEC = 0.35;
-  var ASR_WAIT_MS = 190000;
+  var ASR_WAIT_MS = 65000;
 
   function updateMic() {
     var btn = $("mic-btn");
@@ -1430,12 +1436,40 @@
     });
   }
 
+  function currentSpeechLang() {
+    return speechLang === "zh" ? "zh" : "en";
+  }
+
+  function renderLangToggle() {
+    var btn = $("lang-toggle");
+    if (!btn) return;
+    var zh = currentSpeechLang() === "zh";
+    btn.textContent = zh ? "中文" : "English";
+    btn.classList.toggle("cn", zh);
+  }
+
   function initSpeech() {
+    try {
+      speechLang = localStorage.getItem(SPEECH_LANG_KEY) === "zh" ? "zh" : "en";
+    } catch (e) {
+      speechLang = "en";
+    }
+    renderLangToggle();
     if (!micSupported()) {
       var mic = $("mic-btn");
       if (mic) mic.classList.add("off");
       setSpeechHint("这个浏览器不能录音，用 Chrome 打开试试。");
     }
+  }
+
+  function toggleSpeechLang() {
+    if (phase !== "idle") {
+      toast("说完再切换语言");
+      return;
+    }
+    speechLang = currentSpeechLang() === "zh" ? "en" : "zh";
+    try { localStorage.setItem(SPEECH_LANG_KEY, speechLang); } catch (e) { /* 隐私模式不记 */ }
+    renderLangToggle();
   }
 
   function toastMicError(err) {
@@ -1455,6 +1489,7 @@
     micGen++;
     clearTimeout(recordTimer);
     recordTimer = null;
+    if (talkTick) { clearInterval(talkTick); talkTick = null; }
     if (recordProcessor) {
       try { recordProcessor.onaudioprocess = null; } catch (e) { /* ignore */ }
       try {
@@ -1610,16 +1645,22 @@
     setSpeechHint(IDLE_SPEECH_HINT);
   }
 
-  function sendWav(blob) {
+  function sendWav(blob, lang, isFinal) {
     var ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    if (talk) talk.controller = ctrl;
     var timer = setTimeout(function () {
       if (ctrl) {
+        ctrl.timedOut = true;
         try { ctrl.abort(); } catch (e) { /* ignore */ }
       }
     }, ASR_WAIT_MS);
     return fetch("/api/transcribe", {
       method: "POST",
-      headers: { "Content-Type": "audio/wav" },
+      headers: {
+        "Content-Type": "audio/wav",
+        "x-speech-lang": lang === "zh" ? "zh" : "en",
+        "x-speech-final": isFinal ? "1" : "0"
+      },
       body: blob,
       signal: ctrl ? ctrl.signal : undefined
     }).then(function (res) {
@@ -1639,111 +1680,266 @@
         if (errText.indexOf("没有收到音频") >= 0 || errText.indexOf("没录到") >= 0) {
           throw new Error("没录到声音，再试一次");
         }
-        throw new Error("识别失败，再试一次");
+        throw new Error(errText || "识别失败，再试一次");
       }
       return String(res.data.text || "").trim();
     }, function (err) {
       clearTimeout(timer);
+      if (err && err.kind) throw err;
       if (err && (err.name === "AbortError" || err.name === "TimeoutError")) {
-        throw new Error("识别超时，再试一次");
+        if (ctrl && ctrl.timedOut) throw new Error("识别超时，再试一次");
+        var aborted = new Error("aborted");
+        aborted.kind = "abort";
+        throw aborted;
       }
-      if (err && err.message && (err.message.indexOf("再试一次") >= 0 || err.kind === "auth")) throw err;
+      if (err && err.message && err.message.indexOf("再试一次") >= 0) throw err;
       throw new Error("识别失败，再试一次");
     });
   }
 
-  function finishRecording() {
-    if (phase !== "listening") return;
-    phase = "recognizing";
-    clearTimeout(recordTimer);
-    recordTimer = null;
-    var chunks = recordChunks.slice();
-    var fromRate = recordSampleRate || TARGET_RATE;
+  function countSamples(chunks) {
+    var n = 0;
+    for (var i = 0; i < chunks.length; i++) n += chunks[i].length;
+    return n;
+  }
+
+  function wavFromChunks(chunks, fromRate) {
+    var merged = mergeFloats(chunks);
+    var samples = resample(merged, fromRate || TARGET_RATE, TARGET_RATE);
+    var maxSamples = TARGET_RATE * 110;
+    if (samples.length > maxSamples) samples = samples.subarray(0, maxSamples);
+    if (!samples.length) return null;
+    return encodeWav(floatTo16(samples), TARGET_RATE);
+  }
+
+  function clipHeard(text) {
+    return text.length > 42 ? text.slice(0, 42) + "…" : text;
+  }
+
+  function showPartial(text) {
+    var input = $("chat-input");
+    if (input) input.value = text;
+    if (!talk || !talk.finalizing) setSpeechHint("听到了：" + clipHeard(text));
+  }
+
+  function pushSamples(ch) {
+    if (!talk || phase !== "listening" || !ch || !ch.length) return;
+    var copy = ch instanceof Float32Array ? new Float32Array(ch) : new Float32Array(ch);
+    recordChunks.push(copy);
+    var sum = 0;
+    for (var i = 0; i < copy.length; i++) sum += copy[i] * copy[i];
+    var level = Math.sqrt(sum / copy.length);
+    // 只把安静的片段当成底噪。一开口就说时，不能把说话声学成底噪。
+    if (level < 0.02) {
+      talk.noise += level;
+      talk.noiseCount++;
+    }
+    var floor = talk.noiseCount ? talk.noise / talk.noiseCount : 0.008;
+    if (level >= Math.max(0.018, floor * 2.5)) {
+      talk.heard = true;
+      talk.lastVoiceAt = Date.now();
+    }
+  }
+
+  function failTalk(message) {
+    if (talk && talk.controller) {
+      try { talk.controller.abort(); } catch (e) { /* ignore */ }
+    }
+    talk = null;
+    pendingRelease = null;
+    pointerDown = false;
+    phase = "idle";
+    shadowTarget = null;
     releaseMic();
     updateMic();
-    setPlaceholder("正在识别…");
-    setSpeechHint("正在识别…");
+    setPlaceholder("打字，或点麦克风说…");
+    setSpeechHint(IDLE_SPEECH_HINT);
+    if (message) toast(message);
+  }
 
-    var wav = null;
-    try {
-      var merged = mergeFloats(chunks);
-      var heardFor = fromRate ? merged.length / fromRate : 0;
-      if (!merged.length || heardFor < MIN_RECORD_SEC) {
-        shadowTarget = null;
-        resetSpeechUi();
-        toast("没录到声音，再试一次");
-        return;
-      }
-      var samples = resample(merged, fromRate, TARGET_RATE);
-      var maxSamples = TARGET_RATE * 110;
-      if (samples.length > maxSamples) samples = samples.subarray(0, maxSamples);
-      if (!samples.length) {
-        shadowTarget = null;
-        resetSpeechUi();
-        toast("没录到声音，再试一次");
-        return;
-      }
-      wav = encodeWav(floatTo16(samples), TARGET_RATE);
-    } catch (e) {
+  function completeTalk() {
+    var session = talk;
+    var text = session && session.lastText ? String(session.lastText).trim() : "";
+    var shadow = !!(session && session.shadow);
+    talk = null;
+    pendingRelease = null;
+    pointerDown = false;
+    phase = "idle";
+    if (talkTick) { clearInterval(talkTick); talkTick = null; }
+    updateMic();
+    setPlaceholder("打字，或点麦克风说…");
+    if (!text) {
       shadowTarget = null;
-      resetSpeechUi();
-      toast("识别失败，再试一次");
+      setSpeechHint(IDLE_SPEECH_HINT);
+      toast("没听到说话，再试一次");
+      return;
+    }
+    var input = $("chat-input");
+    if (input) input.value = text;
+    setSpeechHint("听到了：" + clipHeard(text));
+    // 只把转写留在输入框里，等小朋友自己点发送。
+    if (shadow) handleShadowResult();
+  }
+
+  function pumpTalk(isFinal) {
+    if (!talk || talk.inflight) return;
+    var chunks = talk.frozen || recordChunks;
+    var rate = talk.rate || recordSampleRate || TARGET_RATE;
+    var samples = countSamples(chunks);
+    var sec = rate ? samples / rate : 0;
+    if (isFinal && talk.sentOnce && talk.sentSamples >= samples && talk.lastText) {
+      completeTalk();
+      return;
+    }
+    if (sec < L.SPEECH_MIN_SEC) {
+      if (isFinal) {
+        if (talk.lastText) completeTalk();
+        else failTalk("没录到声音，再试一次");
+      }
+      return;
+    }
+    var wav = null;
+    try { wav = wavFromChunks(chunks, rate); }
+    catch (e) {
+      if (isFinal) failTalk("识别失败，再试一次");
       return;
     }
     if (!wav || wav.size <= 44) {
-      shadowTarget = null;
-      resetSpeechUi();
-      toast("没录到声音，再试一次");
+      if (isFinal) failTalk("没录到声音，再试一次");
       return;
     }
     if (wav.size > 8 * 1024 * 1024) {
-      shadowTarget = null;
-      resetSpeechUi();
-      toast("识别失败，再试一次");
+      if (isFinal) failTalk("识别失败，再试一次");
       return;
     }
-
-    var keepShadow = shadowTarget;
-    sendWav(wav).then(function (text) {
-      resetSpeechUi();
-      if (!text) {
-        shadowTarget = null;
-        toast("没听到说话，再试一次");
+    talk.inflight = true;
+    talk.sentSamples = samples;
+    talk.sentOnce = true;
+    talk.lastSendAt = Date.now();
+    var gen = talk.gen;
+    var endSamples = samples;
+    sendWav(wav, talk.lang, !!isFinal).then(function (text) {
+      if (!talk || talk.gen !== gen) return;
+      talk.inflight = false;
+      if (text && endSamples >= talk.appliedSamples) {
+        talk.appliedSamples = endSamples;
+        talk.lastText = text;
+        showPartial(text);
+      }
+      if (talk.finalizing) {
+        var total = countSamples(talk.frozen || []);
+        if (talk.sentSamples < total) pumpTalk(true);
+        else completeTalk();
         return;
       }
-      var input = $("chat-input");
-      if (input) input.value = text;
-      setSpeechHint("听到了：" + (text.length > 42 ? text.slice(0, 42) + "…" : text));
-      if (keepShadow) {
-        shadowTarget = keepShadow;
-        handleShadowResult();
-      }
+      if (phase === "listening") liveTick();
     }).catch(function (err) {
-      shadowTarget = null;
-      resetSpeechUi();
-      if (err && err.kind === "auth") return;
-      toast((err && err.message) || "识别失败，再试一次");
+      if (!talk || talk.gen !== gen) return;
+      talk.inflight = false;
+      if (err && err.kind === "abort") return;
+      if (err && err.kind === "auth") { failTalk(""); return; }
+      if (talk.finalizing) {
+        if (talk.lastText) completeTalk();
+        else failTalk((err && err.message) || "识别失败，再试一次");
+        return;
+      }
+      talk.lastSendAt = Date.now();
+      if (!talk.warned) {
+        talk.warned = true;
+        toast((err && err.message) || "识别失败，再试一次");
+      }
     });
   }
 
-  function beginCapture() {
+  function finishTalk() {
+    if (!talk || talk.finalizing || phase !== "listening") return;
+    talk.finalizing = true;
+    talk.hold = false;
+    phase = "recognizing";
+    var chunks = recordChunks.slice();
+    var rate = recordSampleRate || TARGET_RATE;
+    releaseMic();
+    talk.frozen = chunks;
+    talk.rate = rate;
+    updateMic();
+    setPlaceholder("正在识别…");
+    setSpeechHint("正在识别…");
+    pumpTalk(true);
+  }
+
+  function liveTick() {
+    if (!talk || phase !== "listening" || talk.finalizing) return;
+    var now = Date.now();
+    var rate = recordSampleRate || TARGET_RATE;
+    var samples = countSamples(recordChunks);
+    var step = L.speechStep({
+      heard: talk.heard,
+      hold: talk.hold,
+      inflight: talk.inflight,
+      sentOnce: talk.sentOnce,
+      elapsedMs: now - talk.startedAt,
+      silentForMs: talk.heard ? now - talk.lastVoiceAt : now - talk.startedAt,
+      audioSec: rate ? samples / rate : 0,
+      unsentSec: rate ? Math.max(0, samples - talk.sentSamples) / rate : 0,
+      sinceSendMs: talk.sentOnce ? now - talk.lastSendAt : 0
+    });
+    if (step === "no-speech") { failTalk("没听到声音，再试一次"); return; }
+    if (step === "final") { finishTalk(); return; }
+    if (step === "partial") pumpTalk(false);
+  }
+
+  function beginCapture(options) {
+    var opt = options || {};
     if (phase === "listening" || phase === "recognizing") return;
     if (!recordCtx || !recordStream || recordCtx.state === "closed") return;
+    if (!opt.shadow && pendingRelease === "finish") {
+      pendingRelease = null;
+      pointerDown = false;
+      phase = "idle";
+      releaseMic();
+      updateMic();
+      setSpeechHint(IDLE_SPEECH_HINT);
+      toast("麦克风刚打开，请再按住说一次");
+      return;
+    }
+    var hold = !!opt.hold;
+    if (opt.shadow || pendingRelease === "tap") hold = false;
+    pendingRelease = null;
     phase = "listening";
     recordChunks = [];
     recordSampleRate = recordCtx.sampleRate || TARGET_RATE;
+    talk = {
+      gen: micGen,
+      startedAt: Date.now(),
+      lastVoiceAt: Date.now(),
+      heard: false,
+      inflight: false,
+      sentSamples: 0,
+      appliedSamples: -1,
+      lastSendAt: 0,
+      sentOnce: false,
+      lastText: "",
+      hold: hold,
+      shadow: !!opt.shadow,
+      lang: opt.lang === "zh" ? "zh" : (opt.lang === "en" ? "en" : currentSpeechLang()),
+      finalizing: false,
+      noise: 0,
+      noiseCount: 0,
+      warned: false,
+      controller: null,
+      frozen: null,
+      rate: recordSampleRate
+    };
     updateMic();
     setPlaceholder("我在听…");
-    setSpeechHint(shadowTarget ? "跟读中，说完再点一次麦克风" : "我在听，说完再点一次麦克风");
-    if (window.speechSynthesis) {
+    if (opt.shadow) setSpeechHint("跟读用英文识别，说完会自己停");
+    else if (hold) setSpeechHint("按住说，松开就结束");
+    else setSpeechHint("我在听，说到的字会写进框里");
+    if (!opt.shadow && window.speechSynthesis) {
       try { window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
     }
-    clearTimeout(recordTimer);
-    recordTimer = setTimeout(function () {
-      if (phase !== "listening") return;
-      toast("说太久了，先识别到这里");
-      finishRecording();
-    }, MAX_RECORD_MS);
+    if (talkTick) clearInterval(talkTick);
+    talkTick = setInterval(liveTick, 200);
 
     var gen = micGen;
     var ctx = recordCtx;
@@ -1751,6 +1947,7 @@
 
     function failStart() {
       if (gen !== micGen || phase !== "listening") return;
+      talk = null;
       shadowTarget = null;
       releaseMic();
       resetSpeechUi();
@@ -1779,7 +1976,7 @@
         if (gen !== micGen || phase !== "listening") return;
         var ch = e.inputBuffer.getChannelData(0);
         if (!ch || !ch.length) return;
-        recordChunks.push(new Float32Array(ch));
+        pushSamples(ch);
       };
       connect(node);
     }
@@ -1801,7 +1998,7 @@
             if (gen !== micGen || phase !== "listening") return;
             var data = ev.data;
             if (!data || !data.length) return;
-            recordChunks.push(data instanceof Float32Array ? data : new Float32Array(data));
+            pushSamples(data);
           };
           connect(node);
         } catch (e) {
@@ -1817,7 +2014,9 @@
     useScriptProcessor();
   }
 
-  function toggleMic() {
+  function onMicDown(e) {
+    if (e && e.button != null && e.button !== 0) return;
+    if (e && e.preventDefault) e.preventDefault();
     if (!micSupported()) {
       toast("这个浏览器不能录音，用 Chrome 打开试试");
       return;
@@ -1827,40 +2026,56 @@
       return;
     }
     if (phase === "listening") {
-      finishRecording();
+      finishTalk();
       return;
     }
-    if (phase === "arming") {
-      if (shadowTarget && recordStream && recordCtx && recordCtx.state !== "closed") {
-        beginCapture();
-        return;
-      }
-      if (!shadowTarget) {
-        phase = "idle";
-        releaseMic();
-        updateMic();
-        setPlaceholder("打字，或点麦克风说…");
-        setSpeechHint(IDLE_SPEECH_HINT);
-      }
+    if (phase === "arming" && shadowTarget && recordStream && recordCtx && recordCtx.state !== "closed") {
+      beginCapture({ shadow: true, lang: "en", hold: false });
       return;
     }
+    pointerDown = true;
+    pressAt = Date.now();
+    pendingRelease = null;
     shadowTarget = null;
     phase = "arming";
     updateMic();
     setSpeechHint("正在打开麦克风…");
+    if (e && e.currentTarget && e.pointerId != null && e.currentTarget.setPointerCapture) {
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    }
     ensureMic().then(function () {
       if (phase !== "arming") {
-        releaseMic();
+        if (phase !== "listening") releaseMic();
         return;
       }
-      beginCapture();
+      beginCapture({ hold: pointerDown });
     }).catch(function (err) {
+      pointerDown = false;
+      pendingRelease = null;
       if (phase === "arming") phase = "idle";
       releaseMic();
       updateMic();
       setSpeechHint(IDLE_SPEECH_HINT);
       toastMicError(err);
     });
+  }
+
+  function onMicUp() {
+    if (!pointerDown) return;
+    pointerDown = false;
+    var held = Date.now() - pressAt;
+    var long = held >= (L.SPEECH_HOLD_MS || 350);
+    if (phase === "arming") {
+      pendingRelease = long ? "finish" : "tap";
+      return;
+    }
+    if (phase === "listening" && talk && !talk.shadow) {
+      if (long) finishTalk();
+      else {
+        talk.hold = false;
+        setSpeechHint("我在听，说到的字会写进框里");
+      }
+    }
   }
 
   function englishFromCard(c) {
@@ -1883,7 +2098,7 @@
     shadowWaited = 0;
     setTimeout(function () {
       if (!shadowTarget || phase !== "arming") return;
-      beginCapture();
+      beginCapture({ shadow: true, lang: "en", hold: false });
     }, 280);
   }
 
@@ -2424,7 +2639,22 @@
       });
     });
 
-    $("mic-btn").addEventListener("click", toggleMic);
+    var micBtn = $("mic-btn");
+    micBtn.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+    if (window.PointerEvent) {
+      micBtn.addEventListener("pointerdown", onMicDown);
+      micBtn.addEventListener("pointerup", onMicUp);
+      micBtn.addEventListener("pointercancel", onMicUp);
+    } else {
+      micBtn.addEventListener("click", function () {
+        pendingRelease = "tap";
+        onMicDown({ button: 0, preventDefault: function () {} });
+        pointerDown = false;
+        if (phase === "arming") pendingRelease = "tap";
+      });
+    }
+    var langBtn = $("lang-toggle");
+    if (langBtn) langBtn.addEventListener("click", toggleSpeechLang);
     $("tts-toggle").addEventListener("click", function () {
       ttsOn = !ttsOn;
       this.classList.toggle("off", !ttsOn);

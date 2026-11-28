@@ -1,0 +1,5 @@
+# 语音服务跑在 Worker 外面。测试只需要 fastapi 和 httpx；真正转写还要 faster-whisper。
+faster-whisper>=1.1.0
+fastapi>=0.110.0
+uvicorn>=0.27.0
+httpx>=0.27.0
