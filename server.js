@@ -15,6 +15,7 @@ const path = require("path");
 const { handleApi, BODY_LIMIT } = require("./lib/route");
 const { createFsStore } = require("./lib/store-fs");
 const { complete } = require("./lib/deepseek");
+const { transcribe, WAV_MAX_BYTES } = require("./lib/asr");
 const { safeImageName } = require("./lib/core");
 
 const ROOT = __dirname;
@@ -58,6 +59,34 @@ function sendJSON(res, status, obj) {
     "Cache-Control": "no-store"
   });
   res.end(body);
+}
+
+function readBytes(req, limit) {
+  return new Promise((resolve) => {
+    let size = 0;
+    let settled = false;
+    const chunks = [];
+    function finish(result) {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    }
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > limit) {
+        finish({ ok: false, status: 413, error: "音频太大" });
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      if (!size) { finish({ ok: false, status: 400, error: "没有收到音频" }); return; }
+      finish({ ok: true, value: Buffer.concat(chunks) });
+    });
+    req.on("error", () => finish({ ok: false, status: 400, error: "没有收到音频" }));
+  });
 }
 
 function readJson(req) {
@@ -169,8 +198,10 @@ function createLocalServer(options) {
       ocrInline: !!opts.ocrInline,
       header: (name) => headerValue(req, name),
       readJson: () => readJson(req),
+      readBytes: () => readBytes(req, WAV_MAX_BYTES),
       store: store,
-      complete: opts.complete || ((payload, timeoutMs) => complete(apiKey, payload, timeoutMs))
+      complete: opts.complete || ((payload, timeoutMs) => complete(apiKey, payload, timeoutMs)),
+      transcribe: opts.transcribe || ((bytes, timeoutMs) => transcribe(apiKey, bytes, timeoutMs))
     });
     if (result) {
       sendJSON(res, result.status, result.json);

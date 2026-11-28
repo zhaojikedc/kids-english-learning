@@ -145,11 +145,11 @@
       </div>
       <div class="chat-inputbar">
         <button class="icon-btn" id="tts-toggle" title="朗读回答">🔊</button>
-        <button class="icon-btn" id="mic-btn" title="点一下开始说话">🎤</button>
+        <button class="icon-btn" id="mic-btn" title="点一下开始说话，再说一次结束">🎤</button>
         <input id="chat-input" placeholder="打字，或点麦克风说…" autocomplete="off">
         <button class="btn primary small" id="chat-send">发送</button>
       </div>
-      <div class="hint" id="speech-hint"><span id="speech-hint-text">点 🎤 说话 · 识别语言：</span><button id="lang-toggle">English</button></div>
+      <div class="hint" id="speech-hint"><span id="speech-hint-text">点一下开始，再说一次结束。中英文自动识别。</span></div>
     </div>
   </section>
 
@@ -265,7 +265,7 @@
 
 <script src="https://fastly.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
 <script src="logic.js?v=58"></script>
-<script src="app.js?v=59"></script>
+<script src="app.js?v=60"></script>
 <script>
   if ("serviceWorker" in navigator) {
     window.addEventListener("load", function () {

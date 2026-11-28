@@ -29,7 +29,7 @@ DEEPSEEK_API_KEY="你的密钥" node server.js
 npm test
 ```
 
-`test_logic.js` 检查间隔重复和跟读对比。`test_api.js` 检查本地 HTTP、D1 形状的读写，以及识图任务。
+`test_logic.js` 检查间隔重复和跟读对比。`test_api.js` 检查本地 HTTP、D1 形状的读写、识图任务，以及语音转写。
 
 ## 部署到 Cloudflare
 
@@ -45,6 +45,8 @@ npm test
 | `DEEPSEEK_API_KEY` | Secret | | DeepSeek 密钥。用 `wrangler secret put` 或 `--secrets-file` 设置 |
 
 聊天和识图都走官方 `https://api.deepseek.com/chat/completions`，并带上 `thinking: { type: "disabled" }`。不传这个字段时，官方接口默认先思考再回答；非流式要等思考结束，页面会在答案出来前显示超时。日常复习不需要思考模式。页面等聊天的时间略长于服务端的 240 秒，这样服务端自己的超时能回到页面上，而不是页面先掐断。
+
+语音输入不走浏览器自带的语音识别。页面在手机上把声音录成 16-bit PCM WAV（16 kHz、单声道），再交给 `/api/transcribe`。这个接口和其他 `/api/*` 一样要访问码，然后把文件原样转发到官方 `POST https://api.deepseek.com/v1/tools/asr`。语言自动识别，中文和英文都可以。Worker 只转发，不转码。单次最长大约 90 秒，不超过官方的 120 秒和 8 MiB。
 | `ACCESS_CODE` | Secret，可选 | | 公网访问码。不设置时，第一次需要校验的请求会在 D1 里生成一个 6 位数 |
 
 Workers 有日志和 trace（`observability` 已打开）。

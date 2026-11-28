@@ -1,6 +1,7 @@
 import { handleApi, BODY_LIMIT } from "../lib/route.js";
 import { createD1Store } from "../lib/store-d1.js";
 import { complete } from "../lib/deepseek.js";
+import { transcribe, WAV_MAX_BYTES } from "../lib/asr.js";
 import { safeImageName } from "../lib/core.js";
 
 function jsonResponse(result) {
@@ -47,6 +48,33 @@ async function readJson(request) {
   } catch (e) {
     return { ok: false, status: 400, error: "请求格式不对" };
   }
+}
+
+async function readBytes(request, limit) {
+  const declared = Number(request.headers.get("content-length") || 0);
+  if (declared > limit) return { ok: false, status: 413, error: "音频太大" };
+  if (!request.body) return { ok: false, status: 400, error: "没有收到音频" };
+  const reader = request.body.getReader();
+  const chunks = [];
+  let size = 0;
+  while (true) {
+    const step = await reader.read();
+    if (step.done) break;
+    size += step.value.byteLength;
+    if (size > limit) {
+      await reader.cancel();
+      return { ok: false, status: 413, error: "音频太大" };
+    }
+    chunks.push(step.value);
+  }
+  if (!size) return { ok: false, status: 400, error: "没有收到音频" };
+  const buf = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    buf.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, value: buf };
 }
 
 function isPublicRequest(request) {
@@ -96,8 +124,10 @@ async function handle(request, env) {
     ocrInline: true,
     header: (name) => request.headers.get(name) || "",
     readJson: () => readJson(request),
+    readBytes: () => readBytes(request, WAV_MAX_BYTES),
     store: createD1Store(env.DB, env.BUCKET),
-    complete: (payload, timeoutMs) => complete(apiKey, payload, timeoutMs)
+    complete: (payload, timeoutMs) => complete(apiKey, payload, timeoutMs),
+    transcribe: (bytes, timeoutMs) => transcribe(apiKey, bytes, timeoutMs)
   });
 
   if (result) return jsonResponse(result);
