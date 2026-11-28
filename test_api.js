@@ -13,6 +13,7 @@ const { createFsStore } = require("./lib/store-fs");
 const { createD1Store } = require("./lib/store-d1");
 const { createLocalServer } = require("./server");
 const { complete } = require("./lib/deepseek");
+const { validateWav, transcribe, ASR_URL, ASR_TIMEOUT_MS, WAV_MAX_BYTES } = require("./lib/asr");
 
 let pass = 0;
 function ok(name, fn) {
@@ -96,6 +97,44 @@ function openDb() {
 
 const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
+function makeWav(options) {
+  const opts = options || {};
+  const sampleRate = opts.sampleRate || 16000;
+  const channels = opts.channels || 1;
+  const bits = opts.bits == null ? 16 : opts.bits;
+  const format = opts.format == null ? 1 : opts.format;
+  const seconds = opts.seconds == null ? 0.5 : opts.seconds;
+  const samples = Math.max(1, Math.floor(sampleRate * seconds));
+  const block = channels * (bits / 8);
+  const dataSize = samples * block;
+  const extra = opts.extraChunk || Buffer.alloc(0);
+  const buffer = Buffer.alloc(44 + extra.length + dataSize);
+  buffer.write("RIFF", 0);
+  buffer.writeUInt32LE(buffer.length - 8, 4);
+  buffer.write("WAVE", 8);
+  buffer.write("fmt ", 12);
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(format, 20);
+  buffer.writeUInt16LE(channels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * block, 28);
+  buffer.writeUInt16LE(block, 32);
+  buffer.writeUInt16LE(bits, 34);
+  if (extra.length) extra.copy(buffer, 36);
+  const dataAt = 36 + extra.length;
+  buffer.write("data", dataAt);
+  buffer.writeUInt32LE(dataSize, dataAt + 4);
+  return buffer;
+}
+
+function junkChunk() {
+  const chunk = Buffer.alloc(14);
+  chunk.write("JUNK", 0);
+  chunk.writeUInt32LE(5, 4);
+  chunk.write("hello", 8);
+  return chunk;
+}
+
 function ctxFor(store, extra) {
   const options = extra || {};
   return {
@@ -109,8 +148,10 @@ function ctxFor(store, extra) {
     ocrInline: options.ocrInline !== false,
     header: (name) => (options.headers && options.headers[String(name).toLowerCase()]) || "",
     readJson: async () => ({ ok: true, value: options.body || {} }),
+    readBytes: options.readBytes,
     store: store,
-    complete: options.complete || (async () => ({ ok: false, status: 500, content: "", reasoning: "", usage: null, error: "未配置" }))
+    complete: options.complete || (async () => ({ ok: false, status: 500, content: "", reasoning: "", usage: null, error: "未配置" })),
+    transcribe: options.transcribe
   };
 }
 
@@ -242,12 +283,225 @@ async function main() {
     assert.notStrictEqual(stored.json.code, "family-code");
   });
 
-  await ok("没有密钥时聊天和识图会失败", async () => {
+  await ok("没有密钥时聊天、识图和语音转写会失败", async () => {
     const chat = await handleApi(ctxFor(store, { method: "POST", pathname: "/api/chat", body: { messages: [{ role: "user", content: "hi" }] } }));
     assert.strictEqual(chat.status, 500);
     assert.match(chat.json.error, /DEEPSEEK_API_KEY/);
     const ocr = await handleApi(ctxFor(store, { method: "POST", pathname: "/api/ocr-cards", apiKey: "", body: { images: [PNG] } }));
     assert.strictEqual(ocr.status, 500);
+    const speech = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "",
+      readBytes: async () => ({ ok: true, value: makeWav() })
+    }));
+    assert.strictEqual(speech.status, 500);
+    assert.match(speech.json.error, /DEEPSEEK_API_KEY/);
+  });
+
+  await ok("语音转写成功时只返回文本，并原样把 WAV 交给识别", async () => {
+    const wav = makeWav({ extraChunk: junkChunk(), seconds: 0.4 });
+    const checked = validateWav(wav);
+    assert.strictEqual(checked.ok, true);
+    assert.strictEqual(checked.sampleRate, 16000);
+    assert.ok(checked.duration > 0.3 && checked.duration < 0.5);
+    let seen = null;
+    const result = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "test-key",
+      readBytes: async () => ({ ok: true, value: wav }),
+      transcribe: async (bytes, timeoutMs) => {
+        seen = { bytes: Buffer.from(bytes), timeoutMs: timeoutMs };
+        return { ok: true, status: 200, text: "  What is the weather like in Shanghai today?  ", error: "" };
+      }
+    }));
+    assert.strictEqual(result.status, 200);
+    assert.deepStrictEqual(Object.keys(result.json), ["text"]);
+    assert.strictEqual(result.json.text, "What is the weather like in Shanghai today?");
+    assert.strictEqual(seen.timeoutMs, ASR_TIMEOUT_MS);
+    assert.ok(seen.bytes.equals(wav));
+  });
+
+  await ok("语音转写拒绝空音频、非 WAV 和超限音频，且不会请求上游", async () => {
+    let calls = 0;
+    const transcribe = async () => {
+      calls += 1;
+      return { ok: true, status: 200, text: "nope", error: "" };
+    };
+    const missing = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "test-key",
+      readBytes: async () => ({ ok: false, status: 400, error: "没有收到音频" }),
+      transcribe: transcribe
+    }));
+    assert.strictEqual(missing.status, 400);
+    assert.strictEqual(missing.json.error, "没有收到音频");
+
+    const empty = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "test-key",
+      readBytes: async () => ({ ok: true, value: Buffer.alloc(0) }),
+      transcribe: transcribe
+    }));
+    assert.strictEqual(empty.status, 400);
+    assert.strictEqual(empty.json.error, "没有收到音频");
+
+    const webm = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "test-key",
+      readBytes: async () => ({ ok: true, value: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x00]) }),
+      transcribe: transcribe
+    }));
+    assert.strictEqual(webm.status, 400);
+    assert.strictEqual(webm.json.error, "音频格式不对");
+
+    const floatWav = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "test-key",
+      readBytes: async () => ({ ok: true, value: makeWav({ format: 3, bits: 32 }) }),
+      transcribe: transcribe
+    }));
+    assert.strictEqual(floatWav.status, 400);
+    assert.strictEqual(floatWav.json.error, "音频格式不对");
+
+    const tooLong = validateWav(makeWav({ seconds: 121 }));
+    assert.strictEqual(tooLong.ok, false);
+    assert.match(tooLong.error, /120/);
+    const huge = Buffer.alloc(WAV_MAX_BYTES + 1);
+    huge.write("RIFF", 0);
+    const tooBig = validateWav(huge);
+    assert.strictEqual(tooBig.ok, false);
+    assert.strictEqual(tooBig.status, 413);
+    assert.strictEqual(calls, 0);
+  });
+
+  await ok("语音转写把上游错误交给页面，公网请求仍要访问码", async () => {
+    const busy = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "test-key",
+      readBytes: async () => ({ ok: true, value: makeWav() }),
+      transcribe: async () => ({ ok: false, status: 503, text: "", error: "识别服务忙，稍后再试" })
+    }));
+    assert.strictEqual(busy.status, 503);
+    assert.strictEqual(busy.json.error, "识别服务忙，稍后再试");
+
+    const thrown = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      apiKey: "test-key",
+      readBytes: async () => ({ ok: true, value: makeWav() }),
+      transcribe: async () => { throw new Error("socket hang up"); }
+    }));
+    assert.strictEqual(thrown.status, 502);
+    assert.strictEqual(thrown.json.error, "识别失败");
+
+    const hidden = await handleApi(ctxFor(store, { pathname: "/api/access", isPublic: false }));
+    const denied = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      isPublic: true,
+      apiKey: "test-key",
+      headers: { "x-access-code": "000000" },
+      readBytes: async () => ({ ok: true, value: makeWav() }),
+      transcribe: async () => ({ ok: true, status: 200, text: "secret", error: "" })
+    }));
+    assert.strictEqual(denied.status, 401);
+    const allowed = await handleApi(ctxFor(store, {
+      method: "POST",
+      pathname: "/api/transcribe",
+      isPublic: true,
+      apiKey: "test-key",
+      headers: { "x-access-code": hidden.json.code },
+      readBytes: async () => ({ ok: true, value: makeWav() }),
+      transcribe: async () => ({ ok: true, status: 200, text: "a cat", error: "" })
+    }));
+    assert.strictEqual(allowed.status, 200);
+    assert.strictEqual(allowed.json.text, "a cat");
+  });
+
+  await ok("官方语音接口收到 multipart 文件，并翻译上游错误", async () => {
+    const original = global.fetch;
+    const wav = makeWav({ seconds: 0.25 });
+    try {
+      let sent = null;
+      global.fetch = async (url, opts) => {
+        const file = opts.body.get("file");
+        sent = {
+          url: url,
+          method: opts.method,
+          auth: opts.headers.Authorization,
+          contentType: opts.headers["Content-Type"] || opts.headers["content-type"] || "",
+          language: opts.body.get("language"),
+          name: file && file.name,
+          bytes: Buffer.from(await file.arrayBuffer())
+        };
+        return new Response(JSON.stringify({
+          request_id: "req_test",
+          text: "a cat",
+          duration_ms: 250
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      };
+      const okResult = await transcribe("test-key", wav, 1000);
+      assert.strictEqual(okResult.ok, true);
+      assert.strictEqual(okResult.text, "a cat");
+      assert.strictEqual(sent.url, ASR_URL);
+      assert.strictEqual(sent.method, "POST");
+      assert.strictEqual(sent.auth, "Bearer test-key");
+      assert.strictEqual(sent.contentType, "");
+      assert.strictEqual(sent.language, null);
+      assert.strictEqual(sent.name, "speech.wav");
+      assert.ok(sent.bytes.equals(wav));
+
+      global.fetch = async () => new Response(JSON.stringify({ error: { message: "busy" } }), { status: 503 });
+      const busy = await transcribe("test-key", wav, 1000);
+      assert.strictEqual(busy.ok, false);
+      assert.strictEqual(busy.status, 503);
+      assert.strictEqual(busy.error, "识别服务忙，稍后再试");
+
+      global.fetch = async () => new Response("not-json", { status: 200, headers: { "Content-Type": "text/plain" } });
+      const bad = await transcribe("test-key", wav, 1000);
+      assert.strictEqual(bad.ok, false);
+      assert.strictEqual(bad.status, 502);
+
+      global.fetch = async () => {
+        const err = new Error("timed out");
+        err.name = "TimeoutError";
+        throw err;
+      };
+      const timed = await transcribe("test-key", wav, 1000);
+      assert.strictEqual(timed.ok, false);
+      assert.strictEqual(timed.status, 504);
+      assert.strictEqual(timed.error, "识别超时");
+    } finally {
+      global.fetch = original;
+    }
+  });
+
+  await ok("页面把录音发给转写接口，不再使用浏览器语音识别", () => {
+    const app = fs.readFileSync(path.join(__dirname, "public", "app.js"), "utf8");
+    const html = fs.readFileSync(path.join(__dirname, "public", "index.html"), "utf8");
+    const sw = fs.readFileSync(path.join(__dirname, "public", "sw.js"), "utf8");
+    assert.ok(!app.includes("SpeechRecognition"));
+    assert.ok(!app.includes("webkitSpeechRecognition"));
+    assert.ok(app.includes("/api/transcribe"));
+    assert.ok(app.includes("audio/wav"));
+    assert.ok(app.includes("正在识别"));
+    assert.ok(app.includes("麦克风没权限"));
+    assert.ok(app.includes("没录到声音"));
+    assert.ok(app.includes("没听到说话"));
+    assert.ok(app.includes("识别超时"));
+    assert.ok(app.includes("识别失败"));
+    assert.ok(html.includes("app.js?v=60"));
+    assert.ok(html.includes("中英文自动识别"));
+    assert.ok(!html.includes("lang-toggle"));
+    assert.ok(sw.includes("xiaoshu-english-v56"));
+    assert.ok(sw.includes("/app.js?v=60"));
   });
 
   await ok("聊天和识图请求关掉思考模式，并使用当前官方模型", async () => {
@@ -494,6 +748,69 @@ async function main() {
   } finally {
     await new Promise((resolve) => server.close(resolve));
     fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
+  const speechTmp = fs.mkdtempSync(path.join(os.tmpdir(), "xiaoshu-asr-"));
+  let forwarded = null;
+  let upstreamMode = "ok";
+  const speechServer = createLocalServer({
+    root: speechTmp,
+    publicDir: path.join(__dirname, "public"),
+    imagesDir: path.join(speechTmp, "images"),
+    knowledgeDir: path.join(speechTmp, "kb"),
+    apiKey: "test-key",
+    transcribe: async (bytes, timeoutMs) => {
+      forwarded = { bytes: Buffer.from(bytes), timeoutMs: timeoutMs };
+      if (upstreamMode === "error") return { ok: false, status: 502, text: "", error: "识别失败" };
+      return { ok: true, status: 200, text: "I like apples", error: "" };
+    }
+  });
+  await new Promise((resolve) => speechServer.listen(0, "127.0.0.1", resolve));
+  const speechBase = "http://127.0.0.1:" + speechServer.address().port;
+  try {
+    await ok("本地 HTTP 语音接口：成功、缺音频、格式不对、上游失败", async () => {
+      const wav = makeWav({ seconds: 0.3 });
+      const okRes = await fetch(speechBase + "/api/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": "audio/wav" },
+        body: wav
+      });
+      const okJson = await okRes.json();
+      assert.strictEqual(okRes.status, 200);
+      assert.strictEqual(okJson.text, "I like apples");
+      assert.ok(forwarded.bytes.equals(wav));
+      assert.strictEqual(forwarded.timeoutMs, ASR_TIMEOUT_MS);
+
+      forwarded = null;
+      const missing = await fetch(speechBase + "/api/transcribe", { method: "POST" });
+      const missingJson = await missing.json();
+      assert.strictEqual(missing.status, 400);
+      assert.strictEqual(missingJson.error, "没有收到音频");
+      assert.strictEqual(forwarded, null);
+
+      const invalid = await fetch(speechBase + "/api/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": "audio/webm" },
+        body: Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x01, 0x02, 0x03, 0x04])
+      });
+      const invalidJson = await invalid.json();
+      assert.strictEqual(invalid.status, 400);
+      assert.strictEqual(invalidJson.error, "音频格式不对");
+      assert.strictEqual(forwarded, null);
+
+      upstreamMode = "error";
+      const failed = await fetch(speechBase + "/api/transcribe", {
+        method: "POST",
+        headers: { "Content-Type": "audio/wav" },
+        body: wav
+      });
+      const failedJson = await failed.json();
+      assert.strictEqual(failed.status, 502);
+      assert.strictEqual(failedJson.error, "识别失败");
+    });
+  } finally {
+    await new Promise((resolve) => speechServer.close(resolve));
+    fs.rmSync(speechTmp, { recursive: true, force: true });
   }
 
   console.log("\n全部通过：" + pass + " 项");

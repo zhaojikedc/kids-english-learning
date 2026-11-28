@@ -1,10 +1,10 @@
 /* 小树英语 · 离线壳 */
-const CACHE = "xiaoshu-english-v55";
+const CACHE = "xiaoshu-english-v56";
 const CORE = [
   "/",
   "/index.html",
   "/styles.css?v=58",
-  "/app.js?v=59",
+  "/app.js?v=60",
   "/logic.js?v=58",
   "/avatar.svg",
   "/icon-192.png",

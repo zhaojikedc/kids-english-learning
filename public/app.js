@@ -35,11 +35,30 @@
   var chatHistory = [];
   var chatBusy = false;
 
-  var speechLang = "en-US";
   var ttsOn = true;
-  var recognition = null;
-  var listening = false;
   var shadowTarget = null;
+  var phase = "idle";
+  var micGen = 0;
+  var recordCtx = null;
+  var recordStream = null;
+  var recordSource = null;
+  var recordProcessor = null;
+  var recordMute = null;
+  var recordChunks = [];
+  var recordSampleRate = 16000;
+  var recordTimer = null;
+  var shadowWaited = 0;
+  var IDLE_SPEECH_HINT = "点一下开始，再说一次结束。中英文自动识别。";
+  var PCM_WORKLET = [
+    "class PcmCaptureProcessor extends AudioWorkletProcessor {",
+    "  process(inputs) {",
+    "    var ch = inputs[0] && inputs[0][0];",
+    "    if (ch && ch.length) this.port.postMessage(ch.slice(0));",
+    "    return true;",
+    "  }",
+    "}",
+    "registerProcessor('pcm-capture', PcmCaptureProcessor);"
+  ].join("\n");
 
   var profile = { summary: "", updated: "" };
   var logs = [];
@@ -1352,10 +1371,33 @@
   }
 
   /* ---------- 语音 ---------- */
+  // 浏览器自带的语音识别会把声音发到 Google，在中国大陆经常没有转写结果。
+  // 这里在手机上录 16-bit PCM WAV，再交给 /api/transcribe。不要上传 webm。
+  var TARGET_RATE = 16000;
+  var MAX_RECORD_MS = 90000;
+  var MIN_RECORD_SEC = 0.35;
+  var ASR_WAIT_MS = 190000;
+
   function updateMic() {
     var btn = $("mic-btn");
     if (!btn) return;
-    btn.classList.toggle("on", listening);
+    btn.classList.toggle("on", phase === "listening");
+    btn.disabled = phase === "recognizing";
+  }
+
+  function setSpeechHint(text) {
+    var hint = $("speech-hint-text");
+    if (hint) hint.textContent = text;
+  }
+
+  function setPlaceholder(text) {
+    var input = $("chat-input");
+    if (input) input.placeholder = text;
+  }
+
+  function micSupported() {
+    var AudioCtx = window.AudioContext || window.webkitAudioContext;
+    return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && AudioCtx);
   }
 
   function speak(text) {
@@ -1389,69 +1431,436 @@
   }
 
   function initSpeech() {
-    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
+    if (!micSupported()) {
       var mic = $("mic-btn");
       if (mic) mic.classList.add("off");
-      var hint = $("speech-hint-text");
-      if (hint) hint.textContent = "这个浏览器不支持语音输入，用 Safari 打开试试。";
+      setSpeechHint("这个浏览器不能录音，用 Chrome 打开试试。");
+    }
+  }
+
+  function toastMicError(err) {
+    var name = (err && err.name) || "";
+    if (name === "NotAllowedError" || name === "PermissionDeniedError" || name === "SecurityError") {
+      toast("麦克风没权限，请在系统设置里允许浏览器使用麦克风");
       return;
     }
-    recognition = new SR();
-    recognition.lang = speechLang;
-    recognition.interimResults = false;
-    recognition.continuous = false;
-    recognition.maxAlternatives = 1;
+    if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+      toast("没找到麦克风");
+      return;
+    }
+    toast("启动失败，再点一次");
+  }
 
-    recognition.onstart = function () {
-      listening = true;
-      updateMic();
-      $("chat-input").placeholder = "我在听…";
-      $("speech-hint-text").textContent = "我在听，说完就填进框里";
-    };
-    recognition.onresult = function (e) {
-      var text = "";
-      for (var i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
-      text = text.trim();
-      $("chat-input").value = text;
-      $("speech-hint-text").textContent = "听到了：" + text;
-    };
-    recognition.onerror = function (e) {
-      listening = false;
-      updateMic();
-      var map = {
-        "not-allowed": "麦克风没权限，去系统设置里允许浏览器使用麦克风",
-        "no-speech": "没听到声音，再试一次",
-        "audio-capture": "没找到麦克风",
-        "network": "识别服务连不上，换 Safari 或直接打字"
+  function releaseMic() {
+    micGen++;
+    clearTimeout(recordTimer);
+    recordTimer = null;
+    if (recordProcessor) {
+      try { recordProcessor.onaudioprocess = null; } catch (e) { /* ignore */ }
+      try {
+        if (recordProcessor.port) recordProcessor.port.onmessage = null;
+      } catch (e) { /* ignore */ }
+      try { recordProcessor.disconnect(); } catch (e) { /* ignore */ }
+      recordProcessor = null;
+    }
+    if (recordSource) {
+      try { recordSource.disconnect(); } catch (e) { /* ignore */ }
+      recordSource = null;
+    }
+    if (recordMute) {
+      try { recordMute.disconnect(); } catch (e) { /* ignore */ }
+      recordMute = null;
+    }
+    if (recordStream) {
+      var tracks = recordStream.getTracks();
+      for (var i = 0; i < tracks.length; i++) {
+        try { tracks[i].stop(); } catch (e) { /* ignore */ }
+      }
+      recordStream = null;
+    }
+    if (recordCtx) {
+      var ctx = recordCtx;
+      recordCtx = null;
+      try { ctx.close(); } catch (e) { /* ignore */ }
+    }
+    recordChunks = [];
+  }
+
+  function ensureMic() {
+    if (recordStream && recordCtx && recordCtx.state !== "closed") return Promise.resolve();
+    var AudioCtx = window.AudioContext || window.webkitAudioContext;
+    try {
+      if (!recordCtx || recordCtx.state === "closed") recordCtx = new AudioCtx();
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    var resume = recordCtx.resume();
+    if (resume && typeof resume.catch === "function") resume.catch(function () { /* ignore */ });
+    return navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: { ideal: 1 },
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    }).catch(function (err) {
+      if (err && (err.name === "OverconstrainedError" || err.name === "ConstraintNotSatisfiedError")) {
+        return navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+      throw err;
+    }).then(function (stream) {
+      if (!recordCtx || recordCtx.state === "closed") {
+        var tracks = stream.getTracks();
+        for (var i = 0; i < tracks.length; i++) {
+          try { tracks[i].stop(); } catch (e) { /* ignore */ }
+        }
+        return;
+      }
+      recordStream = stream;
+      if (recordCtx.state === "suspended" && recordCtx.resume) return recordCtx.resume();
+    });
+  }
+
+  function mergeFloats(chunks) {
+    var len = 0;
+    for (var i = 0; i < chunks.length; i++) len += chunks[i].length;
+    var out = new Float32Array(len);
+    var offset = 0;
+    for (var j = 0; j < chunks.length; j++) {
+      out.set(chunks[j], offset);
+      offset += chunks[j].length;
+    }
+    return out;
+  }
+
+  function resample(input, fromRate, toRate) {
+    if (!input.length || !fromRate || fromRate === toRate) return input;
+    if (fromRate > toRate) {
+      var ratio = fromRate / toRate;
+      var newLen = Math.floor(input.length / ratio);
+      if (newLen < 1) return new Float32Array(0);
+      var down = new Float32Array(newLen);
+      var cursor = 0;
+      for (var i = 0; i < newLen; i++) {
+        var next = Math.min(input.length, Math.round((i + 1) * ratio));
+        if (next <= cursor) next = Math.min(input.length, cursor + 1);
+        var sum = 0;
+        var count = next - cursor;
+        for (var j = cursor; j < next; j++) sum += input[j];
+        down[i] = count ? sum / count : 0;
+        cursor = next;
+      }
+      return down;
+    }
+    var upLen = Math.max(1, Math.round(input.length * toRate / fromRate));
+    var up = new Float32Array(upLen);
+    var step = fromRate / toRate;
+    for (var n = 0; n < upLen; n++) {
+      var pos = n * step;
+      var idx = Math.floor(pos);
+      var frac = pos - idx;
+      var a = input[idx] || 0;
+      var b = input[Math.min(idx + 1, input.length - 1)] || 0;
+      up[n] = a + (b - a) * frac;
+    }
+    return up;
+  }
+
+  function floatTo16(input) {
+    var out = new Int16Array(input.length);
+    for (var i = 0; i < input.length; i++) {
+      var s = input[i];
+      if (s > 1) s = 1;
+      else if (s < -1) s = -1;
+      else if (s !== s) s = 0;
+      out[i] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+    }
+    return out;
+  }
+
+  function encodeWav(samples, sampleRate) {
+    var n = samples.length;
+    var buffer = new ArrayBuffer(44 + n * 2);
+    var view = new DataView(buffer);
+    function writeStr(offset, text) {
+      for (var i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+    }
+    writeStr(0, "RIFF");
+    view.setUint32(4, 36 + n * 2, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(36, "data");
+    view.setUint32(40, n * 2, true);
+    var offset = 44;
+    for (var i = 0; i < n; i++, offset += 2) view.setInt16(offset, samples[i], true);
+    return new Blob([buffer], { type: "audio/wav" });
+  }
+
+  function resetSpeechUi() {
+    phase = "idle";
+    updateMic();
+    setPlaceholder("打字，或点麦克风说…");
+    setSpeechHint(IDLE_SPEECH_HINT);
+  }
+
+  function sendWav(blob) {
+    var ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    var timer = setTimeout(function () {
+      if (ctrl) {
+        try { ctrl.abort(); } catch (e) { /* ignore */ }
+      }
+    }, ASR_WAIT_MS);
+    return fetch("/api/transcribe", {
+      method: "POST",
+      headers: { "Content-Type": "audio/wav" },
+      body: blob,
+      signal: ctrl ? ctrl.signal : undefined
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        return { status: res.status, ok: res.ok, data: data || {} };
+      });
+    }).then(function (res) {
+      clearTimeout(timer);
+      if (res.status === 401) {
+        var denied = new Error("需要访问码");
+        denied.kind = "auth";
+        throw denied;
+      }
+      var errText = String((res.data && res.data.error) || "");
+      if (res.status === 504 || errText.indexOf("超时") >= 0) throw new Error("识别超时，再试一次");
+      if (!res.ok) {
+        if (errText.indexOf("没有收到音频") >= 0 || errText.indexOf("没录到") >= 0) {
+          throw new Error("没录到声音，再试一次");
+        }
+        throw new Error("识别失败，再试一次");
+      }
+      return String(res.data.text || "").trim();
+    }, function (err) {
+      clearTimeout(timer);
+      if (err && (err.name === "AbortError" || err.name === "TimeoutError")) {
+        throw new Error("识别超时，再试一次");
+      }
+      if (err && err.message && (err.message.indexOf("再试一次") >= 0 || err.kind === "auth")) throw err;
+      throw new Error("识别失败，再试一次");
+    });
+  }
+
+  function finishRecording() {
+    if (phase !== "listening") return;
+    phase = "recognizing";
+    clearTimeout(recordTimer);
+    recordTimer = null;
+    var chunks = recordChunks.slice();
+    var fromRate = recordSampleRate || TARGET_RATE;
+    releaseMic();
+    updateMic();
+    setPlaceholder("正在识别…");
+    setSpeechHint("正在识别…");
+
+    var wav = null;
+    try {
+      var merged = mergeFloats(chunks);
+      var heardFor = fromRate ? merged.length / fromRate : 0;
+      if (!merged.length || heardFor < MIN_RECORD_SEC) {
+        shadowTarget = null;
+        resetSpeechUi();
+        toast("没录到声音，再试一次");
+        return;
+      }
+      var samples = resample(merged, fromRate, TARGET_RATE);
+      var maxSamples = TARGET_RATE * 110;
+      if (samples.length > maxSamples) samples = samples.subarray(0, maxSamples);
+      if (!samples.length) {
+        shadowTarget = null;
+        resetSpeechUi();
+        toast("没录到声音，再试一次");
+        return;
+      }
+      wav = encodeWav(floatTo16(samples), TARGET_RATE);
+    } catch (e) {
+      shadowTarget = null;
+      resetSpeechUi();
+      toast("识别失败，再试一次");
+      return;
+    }
+    if (!wav || wav.size <= 44) {
+      shadowTarget = null;
+      resetSpeechUi();
+      toast("没录到声音，再试一次");
+      return;
+    }
+    if (wav.size > 8 * 1024 * 1024) {
+      shadowTarget = null;
+      resetSpeechUi();
+      toast("识别失败，再试一次");
+      return;
+    }
+
+    var keepShadow = shadowTarget;
+    sendWav(wav).then(function (text) {
+      resetSpeechUi();
+      if (!text) {
+        shadowTarget = null;
+        toast("没听到说话，再试一次");
+        return;
+      }
+      var input = $("chat-input");
+      if (input) input.value = text;
+      setSpeechHint("听到了：" + (text.length > 42 ? text.slice(0, 42) + "…" : text));
+      if (keepShadow) {
+        shadowTarget = keepShadow;
+        handleShadowResult();
+      }
+    }).catch(function (err) {
+      shadowTarget = null;
+      resetSpeechUi();
+      if (err && err.kind === "auth") return;
+      toast((err && err.message) || "识别失败，再试一次");
+    });
+  }
+
+  function beginCapture() {
+    if (phase === "listening" || phase === "recognizing") return;
+    if (!recordCtx || !recordStream || recordCtx.state === "closed") return;
+    phase = "listening";
+    recordChunks = [];
+    recordSampleRate = recordCtx.sampleRate || TARGET_RATE;
+    updateMic();
+    setPlaceholder("我在听…");
+    setSpeechHint(shadowTarget ? "跟读中，说完再点一次麦克风" : "我在听，说完再点一次麦克风");
+    if (window.speechSynthesis) {
+      try { window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+    }
+    clearTimeout(recordTimer);
+    recordTimer = setTimeout(function () {
+      if (phase !== "listening") return;
+      toast("说太久了，先识别到这里");
+      finishRecording();
+    }, MAX_RECORD_MS);
+
+    var gen = micGen;
+    var ctx = recordCtx;
+    var stream = recordStream;
+
+    function failStart() {
+      if (gen !== micGen || phase !== "listening") return;
+      shadowTarget = null;
+      releaseMic();
+      resetSpeechUi();
+      toast("启动失败，再点一次");
+    }
+
+    function connect(node) {
+      if (gen !== micGen || phase !== "listening") {
+        try { node.disconnect(); } catch (e) { /* ignore */ }
+        return;
+      }
+      var mute = ctx.createGain();
+      mute.gain.value = 0;
+      recordMute = mute;
+      recordProcessor = node;
+      recordSource.connect(node);
+      node.connect(mute);
+      mute.connect(ctx.destination);
+    }
+
+    function useScriptProcessor() {
+      var node;
+      try { node = ctx.createScriptProcessor(4096, 1, 1); }
+      catch (e) { failStart(); return; }
+      node.onaudioprocess = function (e) {
+        if (gen !== micGen || phase !== "listening") return;
+        var ch = e.inputBuffer.getChannelData(0);
+        if (!ch || !ch.length) return;
+        recordChunks.push(new Float32Array(ch));
       };
-      toast(map[e.error] || ("语音出错：" + e.error));
-      if (shadowTarget) shadowTarget = null;
-    };
-    recognition.onend = function () {
-      listening = false;
-      updateMic();
-      $("chat-input").placeholder = "打字，或点麦克风说…";
-      if (shadowTarget) handleShadowResult();
-    };
+      connect(node);
+    }
+
+    var source;
+    try { source = ctx.createMediaStreamSource(stream); }
+    catch (e) { failStart(); return; }
+    recordSource = source;
+
+    if (ctx.audioWorklet && typeof ctx.audioWorklet.addModule === "function") {
+      var blob = new Blob([PCM_WORKLET], { type: "application/javascript" });
+      var url = URL.createObjectURL(blob);
+      ctx.audioWorklet.addModule(url).then(function () {
+        try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+        if (gen !== micGen || phase !== "listening") return;
+        try {
+          var node = new AudioWorkletNode(ctx, "pcm-capture");
+          node.port.onmessage = function (ev) {
+            if (gen !== micGen || phase !== "listening") return;
+            var data = ev.data;
+            if (!data || !data.length) return;
+            recordChunks.push(data instanceof Float32Array ? data : new Float32Array(data));
+          };
+          connect(node);
+        } catch (e) {
+          useScriptProcessor();
+        }
+      }).catch(function () {
+        try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+        if (gen !== micGen || phase !== "listening") return;
+        useScriptProcessor();
+      });
+      return;
+    }
+    useScriptProcessor();
   }
 
   function toggleMic() {
-    if (!recognition) {
-      toast("这个浏览器不支持语音输入，用 Safari 试试");
+    if (!micSupported()) {
+      toast("这个浏览器不能录音，用 Chrome 打开试试");
       return;
     }
-    if (listening) {
-      try { recognition.stop(); } catch (e) { /* ignore */ }
+    if (phase === "recognizing") {
+      toast("正在识别，请稍等");
       return;
     }
-    if (shadowTarget) shadowTarget = null;
-    try {
-      recognition.lang = speechLang;
-      recognition.start();
-    } catch (e) {
-      toast("启动失败，再点一次");
+    if (phase === "listening") {
+      finishRecording();
+      return;
     }
+    if (phase === "arming") {
+      if (shadowTarget && recordStream && recordCtx && recordCtx.state !== "closed") {
+        beginCapture();
+        return;
+      }
+      if (!shadowTarget) {
+        phase = "idle";
+        releaseMic();
+        updateMic();
+        setPlaceholder("打字，或点麦克风说…");
+        setSpeechHint(IDLE_SPEECH_HINT);
+      }
+      return;
+    }
+    shadowTarget = null;
+    phase = "arming";
+    updateMic();
+    setSpeechHint("正在打开麦克风…");
+    ensureMic().then(function () {
+      if (phase !== "arming") {
+        releaseMic();
+        return;
+      }
+      beginCapture();
+    }).catch(function (err) {
+      if (phase === "arming") phase = "idle";
+      releaseMic();
+      updateMic();
+      setSpeechHint(IDLE_SPEECH_HINT);
+      toastMicError(err);
+    });
   }
 
   function englishFromCard(c) {
@@ -1464,20 +1873,18 @@
   }
 
   function startListeningAfterSpeech() {
-    if (!shadowTarget) return;
+    if (!shadowTarget || phase !== "arming") return;
     var speech = window.speechSynthesis;
-    if (speech && speech.speaking) {
+    if (speech && (speech.speaking || speech.pending) && shadowWaited < 45) {
+      shadowWaited += 0.3;
       setTimeout(startListeningAfterSpeech, 300);
       return;
     }
-    if (listening) return;
+    shadowWaited = 0;
     setTimeout(function () {
-      if (!shadowTarget || listening) return;
-      try {
-        recognition.lang = speechLang;
-        recognition.start();
-      } catch (e) { /* ignore */ }
-    }, 350);
+      if (!shadowTarget || phase !== "arming") return;
+      beginCapture();
+    }, 280);
   }
 
   function startShadow() {
@@ -1490,14 +1897,35 @@
       toast("先录一张带英文的卡片，再来跟读");
       return;
     }
-    if (!recognition) {
-      toast("这个浏览器不支持语音输入，用 Safari 试试");
+    if (!micSupported()) {
+      toast("这个浏览器不能录音，用 Chrome 打开试试");
+      return;
+    }
+    if (phase !== "idle") {
+      toast("等这次说完再跟读");
       return;
     }
     shadowTarget = pool[Math.floor(Math.random() * pool.length)];
     addMsg("bot", "跟我读这句：\n" + shadowTarget, null, false, "🎯 跟读");
     speak(shadowTarget);
-    setTimeout(startListeningAfterSpeech, 500);
+    phase = "arming";
+    shadowWaited = 0;
+    updateMic();
+    setSpeechHint("先听一遍，听完我会听你读");
+    ensureMic().then(function () {
+      if (!shadowTarget || phase !== "arming") {
+        if (phase !== "listening" && phase !== "recognizing") releaseMic();
+        return;
+      }
+      startListeningAfterSpeech();
+    }).catch(function (err) {
+      shadowTarget = null;
+      if (phase === "arming") phase = "idle";
+      releaseMic();
+      updateMic();
+      setSpeechHint(IDLE_SPEECH_HINT);
+      toastMicError(err);
+    });
   }
 
   function handleShadowResult() {
@@ -2005,12 +2433,6 @@
         try { window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
       }
       toast(ttsOn ? "回答会朗读" : "已关掉朗读");
-    });
-    $("lang-toggle").addEventListener("click", function () {
-      speechLang = speechLang === "en-US" ? "zh-CN" : "en-US";
-      this.textContent = speechLang === "en-US" ? "English" : "中文";
-      this.classList.toggle("cn", speechLang === "zh-CN");
-      if (recognition) recognition.lang = speechLang;
     });
     $("shadow-btn").addEventListener("click", startShadow);
 
