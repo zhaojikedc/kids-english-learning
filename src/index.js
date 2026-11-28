@@ -127,7 +127,12 @@ async function handle(request, env) {
     readBytes: () => readBytes(request, WAV_MAX_BYTES),
     store: createD1Store(env.DB, env.BUCKET),
     complete: (payload, timeoutMs) => complete(apiKey, payload, timeoutMs),
-    transcribe: (bytes, timeoutMs) => transcribe(apiKey, bytes, timeoutMs)
+    transcribe: (bytes, options) => transcribe(secretValue(env, "WHISPER_URL"), bytes, {
+      timeoutMs: options && options.timeoutMs,
+      language: options && options.language,
+      final: !!(options && options.final),
+      token: secretValue(env, "WHISPER_TOKEN")
+    })
   });
 
   if (result) return jsonResponse(result);

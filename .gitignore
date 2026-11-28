@@ -11,3 +11,7 @@ data/
 .DS_Store
 ._*
 bin/cloudflared
+__pycache__/
+*.pyc
+.venv/
+asr/.cache/

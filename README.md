@@ -23,13 +23,23 @@ DEEPSEEK_API_KEY="你的密钥" node server.js
 - 卡片等运行数据写在 `data/`（已忽略，不要提交）。课本图片写到 `~/Desktop/个人知识库/05-课本图片`。周总结 Markdown 写到 `~/Desktop/个人知识库/03-项目/小树英语`。
 - 本机直接打开时，看板「外网访问」能看到访问码。请求如果带了 `x-forwarded-for` 或 `cf-connecting-ip`（例如 cloudflared 临时隧道），接口就要求 `x-access-code`。
 
+语音识别另开一个进程，不在这个 Node 服务里跑模型：
+
+```bash
+pip install -r asr/requirements.txt
+python3 asr/server.py
+```
+
+它默认听 `127.0.0.1:8788`。`node server.js` 会把 `/api/transcribe` 转到这个地址。第一次启动会从 Hugging Face 下载模型。
+
 自测：
 
 ```bash
+pip install fastapi httpx
 npm test
 ```
 
-`test_logic.js` 检查间隔重复和跟读对比。`test_api.js` 检查本地 HTTP、D1 形状的读写、识图任务，以及语音转写。
+`test_logic.js` 检查间隔重复、跟读对比，以及一边说一边出字的节奏。`test_api.js` 检查本地 HTTP、D1 形状的读写、识图任务，以及语音转写。`asr/test_server.py` 不下载模型，检查语言锁定和只转写不翻译。
 
 ## 部署到 Cloudflare
 
@@ -42,12 +52,16 @@ npm test
 | `ASSETS` | Workers 静态资源 | `public/` | 页面、脚本、样式、图标 |
 | `MODEL` | 变量 | `deepseek-flash` | 聊天模型，不是密钥 |
 | `OCR_MODEL` | 变量 | `deepseek-flash` | 识图模型，不是密钥。官方当前带视觉的模型是 `deepseek-flash`；`deepseek-chat` 已不在模型列表里 |
-| `DEEPSEEK_API_KEY` | Secret | | DeepSeek 密钥。用 `wrangler secret put` 或 `--secrets-file` 设置 |
+| `DEEPSEEK_API_KEY` | Secret | | DeepSeek 密钥，只给聊天和识图用。用 `wrangler secret put` 或 `--secrets-file` 设置 |
+| `ACCESS_CODE` | Secret，可选 | | 公网访问码。不设置时，第一次需要校验的请求会在 D1 里生成一个 6 位数 |
+| `WHISPER_URL` | Secret 或变量 | | faster-whisper 服务的根地址，例如 `https://你的语音机器`。Worker 没有这个地址就不会转写。不要写进仓库 |
+| `WHISPER_TOKEN` | Secret，可选 | | 语音服务如果设置了口令，Worker 用它访问。不要写进仓库 |
 
 聊天和识图都走官方 `https://api.deepseek.com/chat/completions`，并带上 `thinking: { type: "disabled" }`。不传这个字段时，官方接口默认先思考再回答；非流式要等思考结束，页面会在答案出来前显示超时。日常复习不需要思考模式。页面等聊天的时间略长于服务端的 240 秒，这样服务端自己的超时能回到页面上，而不是页面先掐断。
 
-语音输入不走浏览器自带的语音识别。页面在手机上把声音录成 16-bit PCM WAV（16 kHz、单声道），再交给 `/api/transcribe`。这个接口和其他 `/api/*` 一样要访问码，然后把文件原样转发到官方 `POST https://api.deepseek.com/v1/tools/asr`。语言自动识别，中文和英文都可以。Worker 只转发，不转码。单次最长大约 90 秒，不超过官方的 120 秒和 8 MiB。
-| `ACCESS_CODE` | Secret，可选 | | 公网访问码。不设置时，第一次需要校验的请求会在 D1 里生成一个 6 位数 |
+语音输入不走浏览器自带的语音识别，也不走 DeepSeek。页面上麦克风旁边有「中文 / English」。点一下麦克风，或者说的时候按住，手机把声音录成 16-bit PCM WAV（16 kHz、单声道）。一边说，一边把「这一句到目前为止」的音频交给 `/api/transcribe`，输入框里的字会跟着变。停顿一下就结束，字留在输入框里，不会自动发送。这个接口和其他 `/api/*` 一样要访问码。Worker 不转码，只把文件转到自建的 faster-whisper。模型是 `mobiuslabsgmbh/faster-whisper-large-v3-turbo`（faster-whisper 里的 `large-v3-turbo`）。`task` 固定为 `transcribe`，`language` 只用页面选的 `en` 或 `zh`，不自动检测，也不翻译。
+
+这个模型跑在 Worker 外面的一台常开电脑上，入口是 `asr/server.py`。本机开发时它听 `127.0.0.1:8788`。线上要把 `WHISPER_URL` 设成 Worker 能够访问的地址（家里的电脑配一个隧道，或一台小服务器）。手机仍然只打开原来的网页，不会直接连语音端口。语音服务默认只绑本机；如果要让 Worker 从公网连过来，设置 `WHISPER_TOKEN`，不要把 8788 端口裸露在网上。音频不落盘。
 
 Workers 有日志和 trace（`observability` 已打开）。
 
@@ -81,6 +95,8 @@ npx wrangler d1 migrations apply kids-english-learning --remote
 # .dev.vars 示例（不要提交真实内容）
 # DEEPSEEK_API_KEY=...
 # ACCESS_CODE=家里自己定的一串
+# WHISPER_URL=http://127.0.0.1:8788
+# WHISPER_TOKEN=如果语音服务设了口令再写
 npx wrangler deploy --secrets-file .dev.vars
 ```
 
@@ -143,7 +159,8 @@ R2 桶 `kids-english-learning` 的前缀：
 - `public/`：页面。`server.js` 和 Worker 都从这里发静态文件。
 - `server.js`：本地 Node 服务。
 - `src/index.js`：Worker 入口。
-- `lib/`：两边共用的接口、识图和存储。
+- `lib/`：两边共用的接口、识图、语音转发和存储。
+- `asr/`：自建 faster-whisper 服务。不部署到 Worker。
 - `migrations/`：D1 表结构和默认设置。
 - `mac/`：原来的 macOS LaunchAgent，路径是那台 Mac 上的。开机自启和 cloudflared 临时隧道都不是线上的跑法，仓库里也没有 `bin/cloudflared`。
 - `启动小树英语.command`：在 Mac 上双击，执行 `node server.js` 并打开浏览器。
@@ -153,7 +170,7 @@ R2 桶 `kids-english-learning` 的前缀：
 这个仓库是公开的。下面这些不能提交：
 
 - `data/` 里的卡片、档案、日志、周总结、聊天、访问码
-- `.env`、`.dev.vars`、API 密钥、`~/.dsh/.credentials.yaml`
+- `.env`、`.dev.vars`、API 密钥、`WHISPER_TOKEN`、`~/.dsh/.credentials.yaml`
 - 孩子的照片。页面头像是绘制的树苗 `public/avatar.svg`，主屏幕图标是橙色「英」字，不是照片
 - 课本页图片。识别出来的图片只进本机知识库目录或 R2
 - AppleDouble `._*` 和 `bin/cloudflared`

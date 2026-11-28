@@ -7,6 +7,7 @@
  * 数据仍写在本机 data/ 和课本图片目录，方便 node server.js 开发。
  * DeepSeek 密钥只从环境变量或本机 ~/.dsh/.credentials.yaml 读取，仓库里不能有密钥。
  * Worker 不会读这个文件。
+ * 语音转到本机 faster-whisper（默认 http://127.0.0.1:8788），不走 DeepSeek。
  */
 
 const http = require("http");
@@ -24,6 +25,7 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "::";
 const MODEL = process.env.MODEL || "deepseek-flash";
 const OCR_MODEL = process.env.OCR_MODEL || "deepseek-flash";
+const WHISPER_URL = process.env.WHISPER_URL || "http://127.0.0.1:8788";
 
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -161,6 +163,10 @@ function createLocalServer(options) {
   const apiKey = opts.apiKey !== undefined ? String(opts.apiKey || "").trim() : readApiKey();
   const model = opts.model || MODEL;
   const ocrModel = opts.ocrModel || OCR_MODEL;
+  const whisperUrl = opts.whisperUrl !== undefined ? String(opts.whisperUrl || "").trim() : WHISPER_URL;
+  const whisperToken = opts.whisperToken !== undefined
+    ? String(opts.whisperToken || "").trim()
+    : String(process.env.WHISPER_TOKEN || "").trim();
   const publicDir = opts.publicDir || PUBLIC_DIR;
   const store = opts.store || createFsStore({
     root: opts.root || ROOT,
@@ -201,7 +207,12 @@ function createLocalServer(options) {
       readBytes: () => readBytes(req, WAV_MAX_BYTES),
       store: store,
       complete: opts.complete || ((payload, timeoutMs) => complete(apiKey, payload, timeoutMs)),
-      transcribe: opts.transcribe || ((bytes, timeoutMs) => transcribe(apiKey, bytes, timeoutMs))
+      transcribe: opts.transcribe || ((bytes, options) => transcribe(whisperUrl, bytes, {
+        timeoutMs: options && options.timeoutMs,
+        language: options && options.language,
+        final: !!(options && options.final),
+        token: whisperToken
+      }))
     });
     if (result) {
       sendJSON(res, result.status, result.json);
@@ -246,7 +257,8 @@ if (require.main === module) {
   const server = createLocalServer({ apiKey: apiKey });
   server.listen(PORT, HOST, () => {
     console.log("小树英语服务已启动: http://" + HOST + ":" + PORT +
-      "  model=" + MODEL + "  key=" + (apiKey ? "已加载" : "缺失"));
+      "  model=" + MODEL + "  key=" + (apiKey ? "已加载" : "缺失") +
+      "  whisper=" + WHISPER_URL);
   });
 }
 

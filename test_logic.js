@@ -96,4 +96,51 @@ ok("compareWords 空目标不炸", () => {
   assert.strictEqual(r.score, 0);
 });
 
+ok("speechStep 停顿后结束，按住时不结束，并给出中间结果", () => {
+  assert.strictEqual(L.speechStep({
+    heard: true,
+    elapsedMs: 2000,
+    silentForMs: L.SPEECH_SILENCE_MS,
+    audioSec: 1.2,
+    hold: false
+  }), "final");
+  assert.strictEqual(L.speechStep({
+    heard: true,
+    elapsedMs: 2000,
+    silentForMs: L.SPEECH_SILENCE_MS + 500,
+    audioSec: 1.2,
+    hold: true
+  }), "wait");
+  assert.strictEqual(L.speechStep({
+    heard: true,
+    elapsedMs: 1000,
+    silentForMs: 100,
+    audioSec: 1,
+    unsentSec: L.SPEECH_PARTIAL_SEC,
+    inflight: false,
+    sentOnce: false
+  }), "partial");
+  assert.strictEqual(L.speechStep({
+    heard: true,
+    elapsedMs: 1000,
+    silentForMs: 100,
+    audioSec: 1,
+    unsentSec: L.SPEECH_PARTIAL_SEC,
+    inflight: true,
+    sentOnce: false
+  }), "wait");
+  assert.strictEqual(L.speechStep({
+    heard: false,
+    elapsedMs: L.SPEECH_NO_SPEECH_MS,
+    silentForMs: L.SPEECH_NO_SPEECH_MS
+  }), "no-speech");
+  assert.strictEqual(L.speechStep({
+    heard: true,
+    hold: true,
+    elapsedMs: L.SPEECH_MAX_MS,
+    audioSec: 3,
+    silentForMs: 0
+  }), "final");
+});
+
 console.log("\n全部通过：" + pass + " 项");

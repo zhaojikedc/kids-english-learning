@@ -161,6 +161,40 @@
     };
   }
 
+  // 一边说一边把「这句话到目前为止」再转写一次。faster-whisper 没有流式接口。
+  var SPEECH_PARTIAL_SEC = 0.85;
+  var SPEECH_PARTIAL_GAP_MS = 900;
+  var SPEECH_SILENCE_MS = 1300;
+  var SPEECH_NO_SPEECH_MS = 4500;
+  var SPEECH_MIN_SEC = 0.28;
+  var SPEECH_MAX_MS = 60000;
+  var SPEECH_HOLD_MS = 350;
+
+  function speechStep(state) {
+    var s = state || {};
+    var heard = !!s.heard;
+    var hold = !!s.hold;
+    var inflight = !!s.inflight;
+    var sentOnce = !!s.sentOnce;
+    var elapsed = Number(s.elapsedMs) || 0;
+    var silentFor = Number(s.silentForMs) || 0;
+    var audioSec = Number(s.audioSec) || 0;
+    var unsentSec = Number(s.unsentSec) || 0;
+    var sinceSend = Number(s.sinceSendMs) || 0;
+    var maxMs = s.maxMs == null ? SPEECH_MAX_MS : s.maxMs;
+    var noSpeechMs = s.noSpeechMs == null ? SPEECH_NO_SPEECH_MS : s.noSpeechMs;
+    var silenceMs = s.silenceMs == null ? SPEECH_SILENCE_MS : s.silenceMs;
+    var minSec = s.minSec == null ? SPEECH_MIN_SEC : s.minSec;
+    var minPartialSec = s.minPartialSec == null ? SPEECH_PARTIAL_SEC : s.minPartialSec;
+    var partialGapMs = s.partialGapMs == null ? SPEECH_PARTIAL_GAP_MS : s.partialGapMs;
+
+    if (!heard && elapsed >= noSpeechMs) return "no-speech";
+    if (heard && elapsed >= maxMs) return "final";
+    if (heard && !hold && silentFor >= silenceMs && audioSec >= minSec) return "final";
+    if (heard && !inflight && unsentSec >= minPartialSec && (!sentOnce || sinceSend >= partialGapMs)) return "partial";
+    return "wait";
+  }
+
   return {
     INTERVALS: INTERVALS,
     MAX_BOX: MAX_BOX,
@@ -173,6 +207,14 @@
     tokenize: tokenize,
     scoreCard: scoreCard,
     searchCards: searchCards,
-    compareWords: compareWords
+    compareWords: compareWords,
+    SPEECH_PARTIAL_SEC: SPEECH_PARTIAL_SEC,
+    SPEECH_PARTIAL_GAP_MS: SPEECH_PARTIAL_GAP_MS,
+    SPEECH_SILENCE_MS: SPEECH_SILENCE_MS,
+    SPEECH_NO_SPEECH_MS: SPEECH_NO_SPEECH_MS,
+    SPEECH_MIN_SEC: SPEECH_MIN_SEC,
+    SPEECH_MAX_MS: SPEECH_MAX_MS,
+    SPEECH_HOLD_MS: SPEECH_HOLD_MS,
+    speechStep: speechStep
   };
 });
